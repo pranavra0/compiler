@@ -47,6 +47,50 @@ fn check_rejects_invalid_programs() {
 }
 
 #[test]
+fn diagnostics_include_file_line_and_column() {
+    let (source_path, output_root) = paths("diagnostic_location");
+    fs::write(
+        &source_path,
+        "main :: () -> i32 {\n    return missing;\n}\n",
+    )
+    .unwrap();
+    let result = compiler().arg("check").arg(&source_path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:2:12", source_path.display())),
+        "diagnostic had no source location: {stderr}"
+    );
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_dir_all(output_root);
+}
+
+#[test]
+fn build_requires_a_valid_main_entry_point() {
+    for (label, source) in [
+        ("no_main", "helper :: () {}"),
+        ("main_args", "main :: (arg: i32) -> i32 { return arg; }"),
+        ("main_return", "main :: () -> i64 { return 0; }"),
+        ("main_variable", "main :: 1;"),
+    ] {
+        let (source_path, output_root) = paths(label);
+        fs::write(&source_path, source).unwrap();
+        let result = compiler()
+            .args(["build"])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "invalid entry point accepted: {source}"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("semantic error"));
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(&output_root);
+        let _ = fs::remove_file(output_root.with_extension("o"));
+    }
+}
+
+#[test]
 fn build_rejects_semantically_invalid_program() {
     let (source_path, output_root) = paths("build_invalid");
     fs::write(

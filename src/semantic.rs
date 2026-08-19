@@ -6,6 +6,10 @@ use crate::ast::{
     VariableKind,
 };
 use crate::lexer::Span;
+use crate::typed::{
+    FunctionId, IntegerWidth, LocalId, ResolvedType, TypedBlock, TypedExpr, TypedFunction,
+    TypedParameter, TypedProgram, TypedStmt,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticError {
@@ -63,6 +67,10 @@ pub enum SemanticError {
     },
     TopLevelVariableUnsupported {
         name: String,
+        span: Span,
+    },
+    InvalidEntryPoint {
+        message: String,
         span: Span,
     },
 }
@@ -146,11 +154,36 @@ impl fmt::Display for SemanticError {
                 "top-level variable `{name}` is not supported yet at {}..{}",
                 span.start, span.end
             ),
+            Self::InvalidEntryPoint { message, span } => {
+                write!(f, "{message} at {}..{}", span.start, span.end)
+            }
         }
     }
 }
 
 impl std::error::Error for SemanticError {}
+
+impl SemanticError {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::UndefinedName { span, .. }
+            | Self::DuplicateName { span, .. }
+            | Self::UnknownType { span, .. }
+            | Self::TypeMismatch { span, .. }
+            | Self::InvalidLiteral { span, .. }
+            | Self::InvalidOperand { span, .. }
+            | Self::WrongArgumentCount { span, .. }
+            | Self::NotCallable { span, .. }
+            | Self::ImmutableAssignment { span, .. }
+            | Self::InvalidAssignmentTarget { span }
+            | Self::BreakOutsideLoop { span }
+            | Self::ContinueOutsideLoop { span }
+            | Self::MissingReturn { span, .. }
+            | Self::TopLevelVariableUnsupported { span, .. }
+            | Self::InvalidEntryPoint { span, .. } => *span,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct FunctionSignature {
@@ -202,6 +235,60 @@ pub fn analyze(program: &Program) -> Result<(), SemanticError> {
     Analyzer::new().analyze(program)
 }
 
+/// Analyze and lower a program in one frontend operation.  The returned IR
+/// contains resolved locals, functions, and primitive types; invalid source
+/// never crosses this boundary.
+pub fn analyze_typed(program: &Program) -> Result<TypedProgram, SemanticError> {
+    Analyzer::new().analyze_typed(program)
+}
+
+/// Validate the executable ABI separately from ordinary library analysis.
+/// `check` and `ir` intentionally do not call this function.
+pub fn validate_entry_point(program: &Program) -> Result<(), SemanticError> {
+    let mut main = None;
+    for declaration in &program.declarations {
+        let (name, span) = match declaration {
+            Decl::Function(function) => (&function.name, function.span),
+            Decl::Variable(variable) => (&variable.name, variable.span),
+        };
+        if name != "main" {
+            continue;
+        }
+        if main.is_some() {
+            return Err(SemanticError::InvalidEntryPoint {
+                message: "duplicate `main` declarations".into(),
+                span,
+            });
+        }
+        main = Some((declaration, span));
+    }
+    let Some((declaration, span)) = main else {
+        return Err(SemanticError::InvalidEntryPoint {
+            message: "native build requires exactly one `main` function".into(),
+            span: Span::new(0, 0),
+        });
+    };
+    let Decl::Function(function) = declaration else {
+        return Err(SemanticError::InvalidEntryPoint {
+            message: "`main` must be a function".into(),
+            span,
+        });
+    };
+    if !function.params.is_empty() {
+        return Err(SemanticError::InvalidEntryPoint {
+            message: "`main` must not have parameters".into(),
+            span: function.span,
+        });
+    }
+    if function.return_type != Type::Named("i32".into()) {
+        return Err(SemanticError::InvalidEntryPoint {
+            message: "`main` must return i32".into(),
+            span: function.span,
+        });
+    }
+    Ok(())
+}
+
 impl Analyzer {
     pub fn new() -> Self {
         Self {
@@ -229,6 +316,11 @@ impl Analyzer {
         }
 
         Ok(())
+    }
+
+    pub fn analyze_typed(self, program: &Program) -> Result<TypedProgram, SemanticError> {
+        self.analyze(program)?;
+        TypedLowerer::new(program).lower()
     }
 
     /// Collect every function before checking any body. This permits forward
@@ -767,6 +859,385 @@ impl Analyzer {
     }
 }
 
+/// Lowers the already-validated AST into backend-independent typed IR.
+struct TypedLowerer<'a> {
+    program: &'a Program,
+    functions: HashMap<String, (FunctionId, &'a FunctionDecl)>,
+    scopes: Vec<HashMap<String, (LocalId, ResolvedType)>>,
+    next_local: LocalId,
+    current_return_type: ResolvedType,
+}
+
+impl<'a> TypedLowerer<'a> {
+    fn new(program: &'a Program) -> Self {
+        let functions = program
+            .declarations
+            .iter()
+            .enumerate()
+            .filter_map(|(id, declaration)| match declaration {
+                Decl::Function(function) => Some((function.name.clone(), (id, function))),
+                Decl::Variable(_) => None,
+            })
+            .collect();
+        Self {
+            program,
+            functions,
+            scopes: Vec::new(),
+            next_local: 0,
+            current_return_type: ResolvedType::Unit,
+        }
+    }
+
+    fn lower(mut self) -> Result<TypedProgram, SemanticError> {
+        let mut functions = Vec::new();
+        for declaration in &self.program.declarations {
+            let Decl::Function(function) = declaration else {
+                continue;
+            };
+            functions.push(self.lower_function(function)?);
+        }
+        Ok(TypedProgram { functions })
+    }
+
+    fn lower_function(&mut self, function: &FunctionDecl) -> Result<TypedFunction, SemanticError> {
+        self.scopes.push(HashMap::new());
+        self.next_local = 0;
+        self.current_return_type = resolve_type(&function.return_type);
+        let mut params = Vec::new();
+        for parameter in &function.params {
+            let id =
+                self.new_local(&parameter.name, resolve_type(&parameter.ty), parameter.span)?;
+            params.push(TypedParameter {
+                id,
+                name: parameter.name.clone(),
+                ty: resolve_type(&parameter.ty),
+                span: parameter.span,
+            });
+        }
+        let body = self.lower_block_contents(&function.body)?;
+        self.scopes.pop();
+        let id = self.functions[&function.name].0;
+        Ok(TypedFunction {
+            id,
+            name: function.name.clone(),
+            params,
+            return_type: resolve_type(&function.return_type),
+            body,
+            span: function.span,
+        })
+    }
+
+    fn lower_block(&mut self, block: &Block) -> Result<TypedBlock, SemanticError> {
+        self.scopes.push(HashMap::new());
+        let result = self.lower_block_contents(block);
+        self.scopes.pop();
+        result
+    }
+
+    fn lower_block_contents(&mut self, block: &Block) -> Result<TypedBlock, SemanticError> {
+        let statements = block
+            .statements
+            .iter()
+            .map(|statement| self.lower_statement(statement))
+            .collect::<Result<_, _>>()?;
+        Ok(TypedBlock {
+            statements,
+            span: block.span,
+        })
+    }
+
+    fn lower_statement(&mut self, statement: &Stmt) -> Result<TypedStmt, SemanticError> {
+        Ok(match statement {
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => TypedStmt::If {
+                condition: self.lower_expr(condition, Some(ResolvedType::Bool))?,
+                then_branch: self.lower_block(then_branch)?,
+                else_branch: else_branch
+                    .as_ref()
+                    .map(|block| self.lower_block(block))
+                    .transpose()?,
+                span: *span,
+            },
+            Stmt::While {
+                condition,
+                body,
+                span,
+            } => TypedStmt::While {
+                condition: self.lower_expr(condition, Some(ResolvedType::Bool))?,
+                body: self.lower_block(body)?,
+                span: *span,
+            },
+            Stmt::Break { span } => TypedStmt::Break { span: *span },
+            Stmt::Continue { span } => TypedStmt::Continue { span: *span },
+            Stmt::Return { value, span } => TypedStmt::Return {
+                value: value
+                    .as_ref()
+                    .map(|value| self.lower_expr(value, Some(self.current_return_type)))
+                    .transpose()?,
+                span: *span,
+            },
+            Stmt::Variable(variable) => {
+                let declared = variable.ty.as_ref().map(resolve_type);
+                let value = self.lower_expr(&variable.value, declared)?;
+                let ty = declared.unwrap_or(value.ty());
+                let id = self.new_local(&variable.name, ty, variable.span)?;
+                TypedStmt::Declare {
+                    id,
+                    name: variable.name.clone(),
+                    ty,
+                    mutable: !matches!(variable.kind, VariableKind::Immutable),
+                    value,
+                    span: variable.span,
+                }
+            }
+            Stmt::Assignment {
+                target,
+                value,
+                span,
+            } => {
+                let Expr::Identifier {
+                    name,
+                    span: target_span,
+                } = target
+                else {
+                    return Err(SemanticError::InvalidAssignmentTarget {
+                        span: target.span(),
+                    });
+                };
+                let (id, ty) = self
+                    .lookup(name)
+                    .ok_or_else(|| SemanticError::UndefinedName {
+                        name: name.clone(),
+                        span: *target_span,
+                    })?;
+                TypedStmt::Store {
+                    id,
+                    ty,
+                    value: self.lower_expr(value, Some(ty))?,
+                    span: *span,
+                }
+            }
+            Stmt::Expr { expression, span } => TypedStmt::Expr {
+                expression: self.lower_expr(expression, None)?,
+                span: *span,
+            },
+        })
+    }
+
+    fn lower_expr(
+        &mut self,
+        expression: &Expr,
+        expected: Option<ResolvedType>,
+    ) -> Result<TypedExpr, SemanticError> {
+        let span = expression.span();
+        match expression {
+            Expr::Integer { value, .. } => Ok(TypedExpr::Integer {
+                value: *value,
+                ty: expected
+                    .filter(|ty| ty.is_integer())
+                    .unwrap_or(ResolvedType::Integer {
+                        width: IntegerWidth::Bits(32),
+                        signed: true,
+                    }),
+                span,
+            }),
+            Expr::Float { value, .. } => Ok(TypedExpr::Float {
+                value: *value,
+                ty: expected
+                    .filter(|ty| matches!(ty, ResolvedType::Float { .. }))
+                    .unwrap_or(ResolvedType::Float { bits: 64 }),
+                span,
+            }),
+            Expr::Bool { value, .. } => Ok(TypedExpr::Bool {
+                value: *value,
+                ty: ResolvedType::Bool,
+                span,
+            }),
+            Expr::Identifier { name, .. } => {
+                let (id, ty) = self
+                    .lookup(name)
+                    .ok_or_else(|| SemanticError::UndefinedName {
+                        name: name.clone(),
+                        span,
+                    })?;
+                Ok(TypedExpr::Load {
+                    id,
+                    name: name.clone(),
+                    ty,
+                    span,
+                })
+            }
+            Expr::Unary {
+                operator, operand, ..
+            } => {
+                let operand_expected = match operator {
+                    UnaryOp::Not => Some(ResolvedType::Bool),
+                    _ => expected
+                        .filter(|ty| ty.is_integer() || matches!(ty, ResolvedType::Float { .. })),
+                };
+                let operand = self.lower_expr(operand, operand_expected)?;
+                Ok(TypedExpr::Unary {
+                    operator: *operator,
+                    ty: operand.ty(),
+                    operand: Box::new(operand),
+                    span,
+                })
+            }
+            Expr::Binary {
+                left,
+                operator,
+                right,
+                ..
+            } => {
+                let logical = matches!(operator, BinaryOp::LogicalAnd | BinaryOp::LogicalOr);
+                let comparison = matches!(
+                    operator,
+                    BinaryOp::Equal
+                        | BinaryOp::NotEqual
+                        | BinaryOp::Less
+                        | BinaryOp::LessEqual
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEqual
+                );
+                let left_expected = if logical {
+                    Some(ResolvedType::Bool)
+                } else {
+                    expected
+                        .filter(|ty| ty.is_integer() || matches!(ty, ResolvedType::Float { .. }))
+                };
+                let left = self.lower_expr(left, left_expected)?;
+                let right = self.lower_expr(
+                    right,
+                    if logical {
+                        Some(ResolvedType::Bool)
+                    } else {
+                        Some(left.ty())
+                    },
+                )?;
+                let operand_type = left.ty();
+                Ok(TypedExpr::Binary {
+                    left: Box::new(left),
+                    operator: *operator,
+                    right: Box::new(right),
+                    ty: if logical || comparison {
+                        ResolvedType::Bool
+                    } else {
+                        operand_type
+                    },
+                    operand_type,
+                    span,
+                })
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Identifier {
+                    name,
+                    span: callee_span,
+                } = callee.as_ref()
+                else {
+                    return Err(SemanticError::InvalidOperand {
+                        message: "only named functions can be called currently".into(),
+                        span: callee.span(),
+                    });
+                };
+                let (id, function) = self.functions.get(name).copied().ok_or_else(|| {
+                    SemanticError::UndefinedName {
+                        name: name.clone(),
+                        span: *callee_span,
+                    }
+                })?;
+                let parameter_types: Vec<_> = function
+                    .params
+                    .iter()
+                    .map(|parameter| resolve_type(&parameter.ty))
+                    .collect();
+                let arguments = arguments
+                    .iter()
+                    .zip(parameter_types.iter())
+                    .map(|(argument, ty)| self.lower_expr(argument, Some(*ty)))
+                    .collect::<Result<_, _>>()?;
+                Ok(TypedExpr::Call {
+                    function: id,
+                    name: name.clone(),
+                    arguments,
+                    parameter_types,
+                    ty: resolve_type(&function.return_type),
+                    span,
+                })
+            }
+        }
+    }
+
+    fn new_local(
+        &mut self,
+        name: &str,
+        ty: ResolvedType,
+        span: Span,
+    ) -> Result<LocalId, SemanticError> {
+        let id = self.next_local;
+        self.next_local += 1;
+        let scope = self.scopes.last_mut().expect("function scope exists");
+        if scope.contains_key(name) {
+            return Err(SemanticError::DuplicateName {
+                name: name.into(),
+                span,
+            });
+        }
+        scope.insert(name.into(), (id, ty));
+        Ok(id)
+    }
+
+    fn lookup(&self, name: &str) -> Option<(LocalId, ResolvedType)> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+}
+
+fn resolve_type(ty: &Type) -> ResolvedType {
+    match ty {
+        Type::Unit => ResolvedType::Unit,
+        Type::Named(name) => match name.as_str() {
+            "bool" => ResolvedType::Bool,
+            "i8" => int(8, true),
+            "i16" => int(16, true),
+            "i32" => int(32, true),
+            "i64" => int(64, true),
+            "i128" => int(128, true),
+            "u8" => int(8, false),
+            "u16" => int(16, false),
+            "u32" => int(32, false),
+            "u64" => int(64, false),
+            "u128" => int(128, false),
+            "usize" => ResolvedType::Integer {
+                width: IntegerWidth::Pointer,
+                signed: false,
+            },
+            "isize" => ResolvedType::Integer {
+                width: IntegerWidth::Pointer,
+                signed: true,
+            },
+            "f32" => ResolvedType::Float { bits: 32 },
+            "f64" => ResolvedType::Float { bits: 64 },
+            "void" => ResolvedType::Unit,
+            _ => ResolvedType::Unit,
+        },
+    }
+}
+
+fn int(bits: u16, signed: bool) -> ResolvedType {
+    ResolvedType::Integer {
+        width: IntegerWidth::Bits(bits),
+        signed,
+    }
+}
+
 fn named(name: &str) -> Type {
     Type::Named(name.to_string())
 }
@@ -847,6 +1318,43 @@ mod tests {
         }
         let program = Parser::new(tokens).parse().unwrap();
         analyze(&program)
+    }
+
+    #[test]
+    fn validates_native_entry_points_separately_from_library_analysis() {
+        let mut lexer = Lexer::new("helper :: () {}\n");
+        let mut tokens = Vec::new();
+        loop {
+            let token = lexer.next_token().unwrap();
+            let eof = token.kind == TokenKind::Eof;
+            tokens.push(token);
+            if eof {
+                break;
+            }
+        }
+        let program = Parser::new(tokens).parse().unwrap();
+        assert!(analyze(&program).is_ok());
+        assert!(matches!(
+            validate_entry_point(&program),
+            Err(SemanticError::InvalidEntryPoint { .. })
+        ));
+
+        let mut lexer = Lexer::new("main :: (arg: i32) -> i32 { return arg; }");
+        let mut tokens = Vec::new();
+        loop {
+            let token = lexer.next_token().unwrap();
+            let eof = token.kind == TokenKind::Eof;
+            tokens.push(token);
+            if eof {
+                break;
+            }
+        }
+        let program = Parser::new(tokens).parse().unwrap();
+        assert!(matches!(
+            validate_entry_point(&program),
+            Err(SemanticError::InvalidEntryPoint { .. })
+        ));
+        assert!(analyze_typed(&program).is_ok());
     }
 
     #[test]
