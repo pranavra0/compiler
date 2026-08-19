@@ -1,0 +1,1137 @@
+use std::fmt;
+
+use crate::lexer::{Span, Token, TokenKind};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub declarations: Vec<Decl>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decl {
+    Function(FunctionDecl),
+    Variable(VariableDecl),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDecl {
+    pub name: String,
+    pub params: Vec<Parameter>,
+    pub return_type: Type,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariableDecl {
+    pub name: String,
+    pub kind: VariableKind,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariableKind {
+    MutableInferred, // :=
+    MutableTyped,    // : T =
+    Immutable,       // :: expr
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parameter {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub statements: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    If {
+        condition: Expr,
+        then_branch: Block,
+        else_branch: Option<Block>,
+        span: Span,
+    },
+
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
+
+    Variable(VariableDecl),
+
+    Assignment {
+        target: Expr,
+        value: Expr,
+        span: Span,
+    },
+
+    Expr {
+        expression: Expr,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Integer {
+        value: i128,
+        span: Span,
+    },
+
+    Float {
+        value: f64,
+        span: Span,
+    },
+
+    Identifier {
+        name: String,
+        span: Span,
+    },
+
+    Unary {
+        operator: UnaryOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
+
+    Binary {
+        left: Box<Expr>,
+        operator: BinaryOp,
+        right: Box<Expr>,
+        span: Span,
+    },
+
+    Call {
+        callee: Box<Expr>,
+        arguments: Vec<Expr>,
+        span: Span,
+    },
+}
+
+impl Expr {
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Integer { span, .. } => *span,
+            Expr::Float { span, .. } => *span,
+            Expr::Identifier { span, .. } => *span,
+            Expr::Unary { span, .. } => *span,
+            Expr::Binary { span, .. } => *span,
+            Expr::Call { span, .. } => *span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Negate,
+    Not,
+    BitwiseNot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+
+    LogicalAnd,
+    LogicalOr,
+
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Type {
+    Unit,
+    Named(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    UnexpectedToken {
+        expected: String,
+        found: TokenKind,
+        span: Span,
+    },
+
+    UnexpectedEof {
+        expected: String,
+        span: Span,
+    },
+
+    InvalidInteger {
+        lexeme: String,
+        span: Span,
+    },
+
+    InvalidFloat {
+        lexeme: String,
+        span: Span,
+    },
+
+    InvalidDeclaration {
+        span: Span,
+    },
+
+    InvalidAssignmentTarget {
+        span: Span,
+    },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::UnexpectedToken {
+                expected,
+                found,
+                span,
+            } => {
+                write!(
+                    f,
+                    "expected {expected}, found {found} at {}..{}",
+                    span.start, span.end
+                )
+            }
+
+            ParseError::UnexpectedEof { expected, span } => {
+                write!(
+                    f,
+                    "expected {expected}, found end of file at {}..{}",
+                    span.start, span.end
+                )
+            }
+
+            ParseError::InvalidInteger { lexeme, span } => {
+                write!(
+                    f,
+                    "invalid integer literal `{lexeme}` at {}..{}",
+                    span.start, span.end
+                )
+            }
+
+            ParseError::InvalidFloat { lexeme, span } => {
+                write!(
+                    f,
+                    "invalid floating-point literal `{lexeme}` at {}..{}",
+                    span.start, span.end
+                )
+            }
+
+            ParseError::InvalidDeclaration { span } => {
+                write!(f, "invalid declaration at {}..{}", span.start, span.end)
+            }
+
+            ParseError::InvalidAssignmentTarget { span } => {
+                write!(
+                    f,
+                    "invalid assignment target at {}..{}",
+                    span.start, span.end
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+pub struct Parser {
+    tokens: Vec<Token>,
+    position: usize,
+}
+
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            tokens,
+            position: 0,
+        }
+    }
+
+    pub fn parse(&mut self) -> Result<Program, ParseError> {
+        let mut declarations = Vec::new();
+
+        while !self.at(TokenKind::Eof) {
+            declarations.push(self.parse_declaration()?);
+        }
+
+        Ok(Program { declarations })
+    }
+
+    fn parse_declaration(&mut self) -> Result<Decl, ParseError> {
+        let fn_start = self.current().span.start;
+        let has_fn_keyword = self.match_token(TokenKind::Fn);
+        let name = self.expect_identifier()?;
+        let start = if has_fn_keyword {
+            fn_start
+        } else {
+            name.span.start
+        };
+
+        if has_fn_keyword {
+            return Ok(Decl::Function(self.parse_function_after_name(name, start)?));
+        }
+
+        self.expect(TokenKind::DoubleColon)?;
+
+        if self.at(TokenKind::LParen) {
+            return Ok(Decl::Function(self.parse_function_after_name(name, start)?));
+        }
+
+        let value = self.parse_expression()?;
+        let span = Span::new(start, value.span().end);
+
+        self.expect(TokenKind::Semicolon)?;
+
+        Ok(Decl::Variable(VariableDecl {
+            name: name.lexeme,
+            kind: VariableKind::Immutable,
+            ty: None,
+            value,
+            span,
+        }))
+    }
+
+    fn parse_function_after_name(
+        &mut self,
+        name: Token,
+        start: usize,
+    ) -> Result<FunctionDecl, ParseError> {
+        self.expect(TokenKind::LParen)?;
+
+        let mut params = Vec::new();
+
+        if !self.at(TokenKind::RParen) {
+            loop {
+                params.push(self.parse_parameter()?);
+
+                if !self.match_token(TokenKind::Comma) {
+                    break;
+                }
+
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
+            }
+        }
+
+        self.expect(TokenKind::RParen)?;
+
+        let return_type = if self.match_token(TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            Type::Unit
+        };
+
+        let body = self.parse_block()?;
+
+        Ok(FunctionDecl {
+            name: name.lexeme,
+            params,
+            return_type,
+            body: body.clone(),
+            span: Span::new(start, body.span.end),
+        })
+    }
+
+    fn parse_parameter(&mut self) -> Result<Parameter, ParseError> {
+        let name = self.expect_identifier()?;
+        let start = name.span.start;
+
+        self.expect(TokenKind::Colon)?;
+
+        let ty = self.parse_type()?;
+
+        Ok(Parameter {
+            name: name.lexeme,
+            ty,
+            span: Span::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_type(&mut self) -> Result<Type, ParseError> {
+        let token = self.expect_identifier()?;
+
+        Ok(Type::Named(token.lexeme))
+    }
+
+    fn parse_block(&mut self) -> Result<Block, ParseError> {
+        let opening = self.expect(TokenKind::LBrace)?;
+        let start = opening.span.start;
+
+        let mut statements = Vec::new();
+
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            statements.push(self.parse_statement()?);
+        }
+
+        let closing = self.expect(TokenKind::RBrace)?;
+
+        Ok(Block {
+            statements,
+            span: Span::new(start, closing.span.end),
+        })
+    }
+
+    fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
+        if self.match_token(TokenKind::Return) {
+            return self.parse_return_statement();
+        }
+
+        if self.at(TokenKind::If) {
+            return self.parse_if_statement();
+        }
+
+        if self.at(TokenKind::Let) || self.at(TokenKind::Var) {
+            return self.parse_variable_statement();
+        }
+
+        if self.at(TokenKind::Identifier)
+            && (self.peek_kind(1) == Some(TokenKind::ColonEqual)
+                || self.peek_kind(1) == Some(TokenKind::Colon)
+                || self.peek_kind(1) == Some(TokenKind::DoubleColon))
+        {
+            return self.parse_variable_statement();
+        }
+
+        let expression = self.parse_expression()?;
+
+        if self.match_token(TokenKind::Equal) {
+            let start = expression.span().start;
+            let value = self.parse_expression()?;
+
+            if !is_assignable(&expression) {
+                return Err(ParseError::InvalidAssignmentTarget {
+                    span: expression.span(),
+                });
+            }
+
+            let span = Span::new(start, value.span().end);
+
+            self.expect(TokenKind::Semicolon)?;
+
+            return Ok(Stmt::Assignment {
+                target: expression,
+                value,
+                span,
+            });
+        }
+
+        let span = expression.span();
+
+        self.expect(TokenKind::Semicolon)?;
+
+        Ok(Stmt::Expr { expression, span })
+    }
+
+    fn parse_if_statement(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.expect(TokenKind::If)?.span.start;
+        let condition = self.parse_expression()?;
+        let then_branch = self.parse_block()?;
+
+        let else_branch = if self.match_token(TokenKind::Else) {
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+
+        let end = else_branch
+            .as_ref()
+            .map_or(then_branch.span.end, |branch| branch.span.end);
+
+        Ok(Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_return_statement(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.previous().span.start;
+
+        if self.match_token(TokenKind::Semicolon) {
+            return Ok(Stmt::Return {
+                value: None,
+                span: Span::new(start, self.previous().span.end),
+            });
+        }
+
+        let value = self.parse_expression()?;
+        let end = value.span().end;
+
+        self.expect(TokenKind::Semicolon)?;
+
+        Ok(Stmt::Return {
+            value: Some(value),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_variable_statement(&mut self) -> Result<Stmt, ParseError> {
+        let keyword = self.current().kind;
+        let (name, start, kind, ty, needs_equal) = match keyword {
+            TokenKind::Let => {
+                self.advance();
+                let name = self.expect_identifier()?;
+                let start = name.span.start;
+                let ty = if self.match_token(TokenKind::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                (name, start, VariableKind::Immutable, ty, true)
+            }
+
+            TokenKind::Var => {
+                self.advance();
+                let name = self.expect_identifier()?;
+                let start = name.span.start;
+                let ty = if self.match_token(TokenKind::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let kind = if ty.is_some() {
+                    VariableKind::MutableTyped
+                } else {
+                    VariableKind::MutableInferred
+                };
+                (name, start, kind, ty, true)
+            }
+
+            TokenKind::Identifier => {
+                let name = self.expect_identifier()?;
+                let start = name.span.start;
+
+                if self.match_token(TokenKind::ColonEqual) {
+                    (name, start, VariableKind::MutableInferred, None, false)
+                } else if self.match_token(TokenKind::Colon) {
+                    let ty = Some(self.parse_type()?);
+                    (name, start, VariableKind::MutableTyped, ty, true)
+                } else if self.match_token(TokenKind::DoubleColon) {
+                    (name, start, VariableKind::Immutable, None, false)
+                } else {
+                    return Err(ParseError::InvalidDeclaration { span: name.span });
+                }
+            }
+
+            _ => {
+                return Err(ParseError::InvalidDeclaration {
+                    span: self.current().span,
+                });
+            }
+        };
+
+        if needs_equal {
+            self.expect(TokenKind::Equal)?;
+        }
+
+        let value = self.parse_expression()?;
+        let end = value.span().end;
+
+        self.expect(TokenKind::Semicolon)?;
+
+        Ok(Stmt::Variable(VariableDecl {
+            name: name.lexeme,
+            kind,
+            ty,
+            value,
+            span: Span::new(start, end),
+        }))
+    }
+
+    fn parse_expression(&mut self) -> Result<Expr, ParseError> {
+        self.parse_binary_expression(0)
+    }
+
+    fn parse_binary_expression(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
+        let mut left = self.parse_unary_expression()?;
+
+        while let Some(operator) = self.current_binary_operator() {
+            let precedence = operator.precedence();
+
+            if precedence < minimum_precedence {
+                break;
+            }
+
+            self.advance();
+
+            let right = self.parse_binary_expression(precedence + 1)?;
+
+            let span = Span::new(left.span().start, right.span().end);
+
+            left = Expr::Binary {
+                left: Box::new(left),
+                operator,
+                right: Box::new(right),
+                span,
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<Expr, ParseError> {
+        let operator = match self.current().kind {
+            TokenKind::Minus => Some(UnaryOp::Negate),
+            TokenKind::Bang => Some(UnaryOp::Not),
+            TokenKind::Tilde => Some(UnaryOp::BitwiseNot),
+            _ => None,
+        };
+
+        if let Some(operator) = operator {
+            let token = self.advance().clone();
+            let operand = self.parse_unary_expression()?;
+
+            let span = Span::new(token.span.start, operand.span().end);
+
+            return Ok(Expr::Unary {
+                operator,
+                operand: Box::new(operand),
+                span,
+            });
+        }
+
+        self.parse_postfix_expression()
+    }
+
+    fn parse_postfix_expression(&mut self) -> Result<Expr, ParseError> {
+        let mut expression = self.parse_primary_expression()?;
+
+        loop {
+            if !self.match_token(TokenKind::LParen) {
+                break;
+            }
+
+            let mut arguments = Vec::new();
+
+            if !self.at(TokenKind::RParen) {
+                loop {
+                    arguments.push(self.parse_expression()?);
+
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+
+                    if self.at(TokenKind::RParen) {
+                        break;
+                    }
+                }
+            }
+
+            let closing = self.expect(TokenKind::RParen)?;
+
+            let span = Span::new(expression.span().start, closing.span.end);
+
+            expression = Expr::Call {
+                callee: Box::new(expression),
+                arguments,
+                span,
+            };
+        }
+
+        Ok(expression)
+    }
+
+    fn parse_primary_expression(&mut self) -> Result<Expr, ParseError> {
+        let token = self.current().clone();
+
+        match token.kind {
+            TokenKind::Integer => {
+                self.advance();
+
+                let cleaned = token.lexeme.replace('_', "");
+
+                let value = cleaned
+                    .parse::<i128>()
+                    .map_err(|_| ParseError::InvalidInteger {
+                        lexeme: token.lexeme.clone(),
+                        span: token.span,
+                    })?;
+
+                Ok(Expr::Integer {
+                    value,
+                    span: token.span,
+                })
+            }
+
+            TokenKind::Float => {
+                self.advance();
+
+                let cleaned = token.lexeme.replace('_', "");
+                let value = cleaned
+                    .parse::<f64>()
+                    .map_err(|_| ParseError::InvalidFloat {
+                        lexeme: token.lexeme.clone(),
+                        span: token.span,
+                    })?;
+
+                Ok(Expr::Float {
+                    value,
+                    span: token.span,
+                })
+            }
+
+            TokenKind::Identifier => {
+                self.advance();
+
+                Ok(Expr::Identifier {
+                    name: token.lexeme,
+                    span: token.span,
+                })
+            }
+
+            TokenKind::LParen => {
+                self.advance();
+
+                let expression = self.parse_expression()?;
+
+                self.expect(TokenKind::RParen)?;
+
+                Ok(expression)
+            }
+
+            _ => Err(ParseError::UnexpectedToken {
+                expected: "expression".to_string(),
+                found: token.kind,
+                span: token.span,
+            }),
+        }
+    }
+
+    fn current_binary_operator(&self) -> Option<BinaryOp> {
+        match self.current().kind {
+            TokenKind::Plus => Some(BinaryOp::Add),
+            TokenKind::Minus => Some(BinaryOp::Subtract),
+            TokenKind::Star => Some(BinaryOp::Multiply),
+            TokenKind::Slash => Some(BinaryOp::Divide),
+            TokenKind::Percent => Some(BinaryOp::Modulo),
+
+            TokenKind::EqualEqual => Some(BinaryOp::Equal),
+            TokenKind::BangEqual => Some(BinaryOp::NotEqual),
+
+            TokenKind::Less => Some(BinaryOp::Less),
+            TokenKind::LessEqual => Some(BinaryOp::LessEqual),
+            TokenKind::Greater => Some(BinaryOp::Greater),
+            TokenKind::GreaterEqual => Some(BinaryOp::GreaterEqual),
+            TokenKind::ShiftLeft => Some(BinaryOp::ShiftLeft),
+            TokenKind::ShiftRight => Some(BinaryOp::ShiftRight),
+
+            TokenKind::AmpersandAmpersand => Some(BinaryOp::LogicalAnd),
+            TokenKind::PipePipe => Some(BinaryOp::LogicalOr),
+
+            TokenKind::Ampersand => Some(BinaryOp::BitwiseAnd),
+            TokenKind::Pipe => Some(BinaryOp::BitwiseOr),
+            TokenKind::Caret => Some(BinaryOp::BitwiseXor),
+
+            _ => None,
+        }
+    }
+
+    fn current(&self) -> &Token {
+        &self.tokens[self.position]
+    }
+
+    fn previous(&self) -> &Token {
+        &self.tokens[self.position - 1]
+    }
+
+    fn peek_kind(&self, offset: usize) -> Option<TokenKind> {
+        self.tokens
+            .get(self.position + offset)
+            .map(|token| token.kind)
+    }
+
+    fn at(&self, kind: TokenKind) -> bool {
+        self.current().kind == kind
+    }
+
+    fn advance(&mut self) -> &Token {
+        let token = &self.tokens[self.position];
+
+        if token.kind != TokenKind::Eof {
+            self.position += 1;
+        }
+
+        token
+    }
+
+    fn match_token(&mut self, kind: TokenKind) -> bool {
+        if self.at(kind) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, kind: TokenKind) -> Result<Token, ParseError> {
+        if self.at(kind) {
+            return Ok(self.advance().clone());
+        }
+
+        let token = self.current();
+
+        if token.kind == TokenKind::Eof {
+            return Err(ParseError::UnexpectedEof {
+                expected: kind.to_string(),
+                span: token.span,
+            });
+        }
+
+        Err(ParseError::UnexpectedToken {
+            expected: kind.to_string(),
+            found: token.kind,
+            span: token.span,
+        })
+    }
+
+    fn expect_identifier(&mut self) -> Result<Token, ParseError> {
+        if self.at(TokenKind::Identifier) {
+            return Ok(self.advance().clone());
+        }
+
+        let token = self.current();
+
+        if token.kind == TokenKind::Eof {
+            return Err(ParseError::UnexpectedEof {
+                expected: "identifier".to_string(),
+                span: token.span,
+            });
+        }
+
+        Err(ParseError::UnexpectedToken {
+            expected: "identifier".to_string(),
+            found: token.kind,
+            span: token.span,
+        })
+    }
+}
+
+impl BinaryOp {
+    fn precedence(self) -> u8 {
+        match self {
+            BinaryOp::LogicalOr => 1,
+            BinaryOp::LogicalAnd => 2,
+
+            BinaryOp::BitwiseOr => 3,
+            BinaryOp::BitwiseXor => 4,
+            BinaryOp::BitwiseAnd => 5,
+
+            BinaryOp::Equal | BinaryOp::NotEqual => 6,
+
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => 7,
+
+            BinaryOp::ShiftLeft | BinaryOp::ShiftRight => 8,
+
+            BinaryOp::Add | BinaryOp::Subtract => 9,
+
+            BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo => 10,
+        }
+    }
+}
+
+fn is_assignable(expression: &Expr) -> bool {
+    matches!(expression, Expr::Identifier { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse(source: &str) -> Program {
+        let mut lexer = Lexer::new(source);
+        let mut tokens = Vec::new();
+
+        loop {
+            let token = lexer.next_token().expect("lexing failed");
+            let eof = token.kind == TokenKind::Eof;
+
+            tokens.push(token);
+
+            if eof {
+                break;
+            }
+        }
+
+        Parser::new(tokens).parse().expect("parsing failed")
+    }
+
+    #[test]
+    fn parses_hello_program_syntax() {
+        let program = parse(
+            r#"
+            fn main() {
+                let answer = 42;
+                let other = 10.5;
+
+                if answer >= 40 {
+                    return;
+                }
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        assert_eq!(function.name, "main");
+        assert_eq!(function.return_type, Type::Unit);
+        assert_eq!(function.body.statements.len(), 3);
+        assert!(matches!(
+            function.body.statements[0],
+            Stmt::Variable(VariableDecl {
+                kind: VariableKind::Immutable,
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.body.statements[1],
+            Stmt::Variable(VariableDecl {
+                value: Expr::Float { .. },
+                ..
+            })
+        ));
+        assert!(matches!(function.body.statements[2], Stmt::If { .. }));
+    }
+
+    #[test]
+    fn parses_minimal_main() {
+        let program = parse(
+            r#"
+            main :: () -> i32 {
+                return 42;
+            }
+            "#,
+        );
+
+        assert_eq!(program.declarations.len(), 1);
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        assert_eq!(function.name, "main");
+        assert!(function.params.is_empty());
+        assert_eq!(function.return_type, Type::Named("i32".into()));
+        assert_eq!(function.body.statements.len(), 1);
+
+        let Stmt::Return {
+            value: Some(Expr::Integer { value, .. }),
+            ..
+        } = &function.body.statements[0]
+        else {
+            panic!("expected return statement");
+        };
+
+        assert_eq!(*value, 42);
+    }
+
+    #[test]
+    fn parses_function_parameters() {
+        let program = parse(
+            r#"
+            add :: (a: i64, b: i64) -> i64 {
+                return a + b;
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        assert_eq!(function.params.len(), 2);
+
+        assert_eq!(function.params[0].name, "a");
+        assert_eq!(function.params[0].ty, Type::Named("i64".into()));
+
+        assert_eq!(function.params[1].name, "b");
+        assert_eq!(function.params[1].ty, Type::Named("i64".into()));
+    }
+
+    #[test]
+    fn parses_operator_precedence() {
+        let program = parse(
+            r#"
+            main :: () -> i32 {
+                return 1 + 2 * 3;
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        let Stmt::Return {
+            value: Some(expression),
+            ..
+        } = &function.body.statements[0]
+        else {
+            panic!("expected return");
+        };
+
+        let Expr::Binary {
+            operator: BinaryOp::Add,
+            left,
+            right,
+            ..
+        } = expression
+        else {
+            panic!("expected addition");
+        };
+
+        assert!(matches!(left.as_ref(), Expr::Integer { value: 1, .. }));
+
+        let Expr::Binary {
+            operator: BinaryOp::Multiply,
+            left,
+            right,
+            ..
+        } = right.as_ref()
+        else {
+            panic!("expected multiplication");
+        };
+
+        assert!(matches!(left.as_ref(), Expr::Integer { value: 2, .. }));
+
+        assert!(matches!(right.as_ref(), Expr::Integer { value: 3, .. }));
+    }
+
+    #[test]
+    fn parses_function_calls() {
+        let program = parse(
+            r#"
+            main :: () -> i32 {
+                return add(10, 20);
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        let Stmt::Return {
+            value: Some(Expr::Call { arguments, .. }),
+            ..
+        } = &function.body.statements[0]
+        else {
+            panic!("expected function call");
+        };
+
+        assert_eq!(arguments.len(), 2);
+    }
+
+    #[test]
+    fn parses_local_declarations() {
+        let program = parse(
+            r#"
+            main :: () -> i32 {
+                x := 10;
+                y : i32 = 20;
+                z :: 30;
+                return x + y + z;
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        assert_eq!(function.body.statements.len(), 4);
+
+        let Stmt::Variable(variable) = &function.body.statements[0] else {
+            panic!("expected variable");
+        };
+
+        assert_eq!(variable.name, "x");
+        assert_eq!(variable.kind, VariableKind::MutableInferred);
+        assert_eq!(variable.ty, None);
+
+        let Stmt::Variable(variable) = &function.body.statements[1] else {
+            panic!("expected variable");
+        };
+
+        assert_eq!(variable.kind, VariableKind::MutableTyped);
+        assert_eq!(variable.ty, Some(Type::Named("i32".into())));
+
+        let Stmt::Variable(variable) = &function.body.statements[2] else {
+            panic!("expected variable");
+        };
+
+        assert_eq!(variable.kind, VariableKind::Immutable);
+    }
+
+    #[test]
+    fn parses_assignment() {
+        let program = parse(
+            r#"
+            main :: () -> i32 {
+                x := 10;
+                x = 20;
+                return x;
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        assert!(matches!(
+            function.body.statements[1],
+            Stmt::Assignment { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_unary_expression() {
+        let program = parse(
+            r#"
+            main :: () -> i32 {
+                return -42;
+            }
+            "#,
+        );
+
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        let Stmt::Return {
+            value: Some(Expr::Unary { operator, .. }),
+            ..
+        } = &function.body.statements[0]
+        else {
+            panic!("expected unary expression");
+        };
+
+        assert_eq!(*operator, UnaryOp::Negate);
+    }
+}

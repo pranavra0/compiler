@@ -55,8 +55,10 @@ pub enum TokenKind {
 
     Less,
     LessEqual,
+    ShiftLeft,
     Greater,
     GreaterEqual,
+    ShiftRight,
 
     // Bitwise / logical
     Ampersand,
@@ -69,6 +71,7 @@ pub enum TokenKind {
     // Other operators
     Arrow,       // ->
     FatArrow,    // =>
+    ColonEqual,  // :=
     DoubleColon, // ::
 
     // Punctuation
@@ -122,8 +125,10 @@ impl fmt::Display for TokenKind {
 
             TokenKind::Less => "Less",
             TokenKind::LessEqual => "LessEqual",
+            TokenKind::ShiftLeft => "ShiftLeft",
             TokenKind::Greater => "Greater",
             TokenKind::GreaterEqual => "GreaterEqual",
+            TokenKind::ShiftRight => "ShiftRight",
 
             TokenKind::Ampersand => "Ampersand",
             TokenKind::AmpersandAmpersand => "AmpersandAmpersand",
@@ -140,6 +145,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Comma => "Comma",
             TokenKind::Semicolon => "Semicolon",
             TokenKind::Colon => "Colon",
+            TokenKind::ColonEqual => "ColonEqual",
 
             TokenKind::LParen => "LParen",
             TokenKind::RParen => "RParen",
@@ -152,7 +158,6 @@ impl fmt::Display for TokenKind {
         write!(f, "{name}")
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
@@ -174,14 +179,9 @@ impl Token {
 /// produced while lexing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexError {
-    UnexpectedCharacter {
-        character: char,
-        span: Span,
-    },
+    UnexpectedCharacter { character: char, span: Span },
 
-    UnterminatedBlockComment {
-        span: Span,
-    },
+    UnterminatedBlockComment { span: Span },
 }
 
 impl fmt::Display for LexError {
@@ -401,6 +401,9 @@ impl<'a> Lexer<'a> {
         let kind = if self.peek() == Some(b'=') {
             self.bump();
             TokenKind::LessEqual
+        } else if self.peek() == Some(b'<') {
+            self.bump();
+            TokenKind::ShiftLeft
         } else {
             TokenKind::Less
         };
@@ -416,6 +419,9 @@ impl<'a> Lexer<'a> {
         let kind = if self.peek() == Some(b'=') {
             self.bump();
             TokenKind::GreaterEqual
+        } else if self.peek() == Some(b'>') {
+            self.bump();
+            TokenKind::ShiftRight
         } else {
             TokenKind::Greater
         };
@@ -458,11 +464,18 @@ impl<'a> Lexer<'a> {
 
         self.bump();
 
-        let kind = if self.peek() == Some(b':') {
-            self.bump();
-            TokenKind::DoubleColon
-        } else {
-            TokenKind::Colon
+        let kind = match self.peek() {
+            Some(b':') => {
+                self.bump();
+                TokenKind::DoubleColon
+            }
+
+            Some(b'=') => {
+                self.bump();
+                TokenKind::ColonEqual
+            }
+
+            _ => TokenKind::Colon,
         };
 
         Token::new(kind, self.source, Span::new(start, self.position))
@@ -473,11 +486,7 @@ impl<'a> Lexer<'a> {
 
         self.bump();
 
-        Token::new(
-            kind,
-            self.source,
-            Span::new(start, self.position),
-        )
+        Token::new(kind, self.source, Span::new(start, self.position))
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<(), LexError> {
@@ -661,7 +670,7 @@ mod tests {
 
     #[test]
     fn lex_punctuation() {
-        let tokens = lex_all("() [] {} , ; : :: .");
+        let tokens = lex_all("() [] {} , ; : := :: .");
 
         let kinds: Vec<_> = tokens.iter().map(|token| token.kind).collect();
 
@@ -677,6 +686,7 @@ mod tests {
                 TokenKind::Comma,
                 TokenKind::Semicolon,
                 TokenKind::Colon,
+                TokenKind::ColonEqual,
                 TokenKind::DoubleColon,
                 TokenKind::Dot,
                 TokenKind::Eof,
@@ -686,7 +696,7 @@ mod tests {
 
     #[test]
     fn lex_two_character_operators() {
-        let tokens = lex_all("== != <= >= -> => && ||");
+        let tokens = lex_all("== != <= >= << >> -> => && ||");
 
         let kinds: Vec<_> = tokens.iter().map(|token| token.kind).collect();
 
@@ -697,6 +707,8 @@ mod tests {
                 TokenKind::BangEqual,
                 TokenKind::LessEqual,
                 TokenKind::GreaterEqual,
+                TokenKind::ShiftLeft,
+                TokenKind::ShiftRight,
                 TokenKind::Arrow,
                 TokenKind::FatArrow,
                 TokenKind::AmpersandAmpersand,
