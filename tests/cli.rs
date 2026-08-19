@@ -203,6 +203,110 @@ fn builds_and_runs_core_loop_programs() {
 }
 
 #[test]
+fn builds_structs_arrays_globals_and_constants() {
+    let cases = [
+        (
+            "aggregates",
+            52,
+            "Pair :: struct { x: i32; y: i32; } limit :: i32 = 40; counter : i32 = 1; main :: () -> i32 { p := Pair{x = 1, y = 2}; xs := [3]i32{4, 5, 6}; p.x = 3; xs[1] = 7; counter = counter + 1; return p.x + xs[1] + limit + counter; }",
+        ),
+        (
+            "rvalue_access",
+            9,
+            "Pair :: struct { x: i32; } make :: () -> Pair { return Pair{x = 9}; } main :: () -> i32 { return make().x; }",
+        ),
+        (
+            "wrapped_constant",
+            42,
+            "small :: u8 = 255 + 1; ready : bool = small == 0; main :: () -> i32 { if ready { return 42; } return 0; }",
+        ),
+    ];
+
+    for (label, expected, source) in cases {
+        let (source_path, output_root) = paths(label);
+        fs::write(&source_path, source).unwrap();
+        let build = compiler()
+            .args(["build"])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&output_root)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{label} build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = Command::new(&output_root).status().unwrap();
+        assert_eq!(run.code(), Some(expected), "incorrect result for {label}");
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(&output_root);
+        let _ = fs::remove_file(output_root.with_extension("o"));
+    }
+}
+
+#[test]
+fn memory_example_exercises_raw_pointers_slices_layout_and_indexing() {
+    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/memory.compy");
+    let output_root =
+        std::env::temp_dir().join(format!("compiler_memory_example_{}", std::process::id()));
+    let build = compiler()
+        .args(["build"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&output_root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "memory example failed to build: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_root).status().unwrap();
+    assert_eq!(run.code(), Some(88));
+    let _ = fs::remove_file(&output_root);
+    let _ = fs::remove_file(output_root.with_extension("o"));
+}
+
+#[test]
+fn checked_memory_index_traps_at_runtime() {
+    let source_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/memory_checked_trap.compy");
+    let output_root =
+        std::env::temp_dir().join(format!("compiler_memory_trap_{}", std::process::id()));
+    let build = compiler()
+        .args(["build"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&output_root)
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "trap example failed to build");
+    let run = Command::new(&output_root).status().unwrap();
+    assert!(!run.success(), "an invalid checked index returned normally");
+    let _ = fs::remove_file(&output_root);
+    let _ = fs::remove_file(output_root.with_extension("o"));
+}
+
+#[test]
+fn unchecked_index_has_no_generated_bounds_trap() {
+    let (source_path, output_root) = paths("unchecked_ir");
+    fs::write(
+        &source_path,
+        "main :: () -> i32 { values := [2]i32{10, 20}; return unchecked_index(values, 1); }",
+    )
+    .unwrap();
+    let ir = compiler().arg("ir").arg(&source_path).output().unwrap();
+    assert!(ir.status.success(), "unchecked example failed to lower");
+    let text = String::from_utf8_lossy(&ir.stdout);
+    assert!(text.contains("getelementptr"));
+    assert!(!text.contains("index.valid"));
+    assert!(!text.contains("llvm.trap"));
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(output_root);
+}
+
+#[test]
 fn rejects_invalid_loop_programs_before_codegen() {
     let cases = [
         "main :: () -> i32 { break; return 0; }",

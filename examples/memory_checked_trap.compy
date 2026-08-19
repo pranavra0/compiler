@@ -1,0 +1,7 @@
+// Expected to compile, then trap when the checked slice index is invalid.
+main :: () -> i32 {
+    values := [2]i32{10, 20};
+    view := make_slice(&values[0], 2);
+    index: usize = 2;
+    return view[index];
+}

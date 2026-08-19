@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::ast::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, Parameter, Program, Stmt, Type, UnaryOp,
-    VariableDecl, VariableKind,
+    BinaryOp, Block, Decl, Expr, FunctionDecl, Parameter, Program, Stmt, StructDecl, StructField,
+    StructInit, Type, UnaryOp, VariableDecl, VariableKind,
 };
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -131,21 +131,42 @@ impl Parser {
             return Ok(Decl::Function(self.parse_function_after_name(name, start)?));
         }
 
-        self.expect(TokenKind::DoubleColon)?;
+        let operator = if self.at(TokenKind::DoubleColon) {
+            self.advance();
+            TokenKind::DoubleColon
+        } else {
+            self.expect(TokenKind::Colon)?;
+            TokenKind::Colon
+        };
 
-        if self.at(TokenKind::LParen) {
+        if operator == TokenKind::DoubleColon && self.at(TokenKind::LParen) {
             return Ok(Decl::Function(self.parse_function_after_name(name, start)?));
         }
+        if operator == TokenKind::DoubleColon && self.at(TokenKind::Struct) {
+            return Ok(Decl::Struct(self.parse_struct_after_name(name, start)?));
+        }
 
+        // `name :: T = value` is the explicitly typed constant form.
+        let typed = self.looks_like_typed_declaration();
+        let ty = if typed {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        if typed {
+            self.expect(TokenKind::Equal)?;
+        }
         let value = self.parse_expression()?;
         let span = Span::new(start, value.span().end);
-
         self.expect(TokenKind::Semicolon)?;
-
         Ok(Decl::Variable(VariableDecl {
             name: name.lexeme,
-            kind: VariableKind::Immutable,
-            ty: None,
+            kind: if operator == TokenKind::Colon {
+                VariableKind::MutableTyped
+            } else {
+                VariableKind::Immutable
+            },
+            ty,
             value,
             span,
         }))
@@ -209,9 +230,61 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        if self.match_token(TokenKind::Star) {
+            return Ok(Type::Pointer(Box::new(self.parse_type()?)));
+        }
+        if self.match_token(TokenKind::LBracket) {
+            if self.match_token(TokenKind::RBracket) {
+                return Ok(Type::Slice(Box::new(self.parse_type()?)));
+            }
+            let token = self.expect(TokenKind::Integer)?;
+            let length = token.lexeme.replace('_', "").parse::<u64>().map_err(|_| {
+                ParseError::InvalidInteger {
+                    lexeme: token.lexeme.clone(),
+                    span: token.span,
+                }
+            })?;
+            self.expect(TokenKind::RBracket)?;
+            let element = self.parse_type()?;
+            return Ok(Type::Array {
+                length,
+                element: Box::new(element),
+            });
+        }
         let token = self.expect_identifier()?;
-
         Ok(Type::Named(token.lexeme))
+    }
+
+    fn parse_struct_after_name(
+        &mut self,
+        name: Token,
+        start: usize,
+    ) -> Result<StructDecl, ParseError> {
+        self.expect(TokenKind::Struct)?;
+        self.expect(TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let field = self.expect_identifier()?;
+            let field_start = field.span.start;
+            self.expect(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let end = self.previous().span.end;
+            fields.push(StructField {
+                name: field.lexeme,
+                ty,
+                span: Span::new(field_start, end),
+            });
+            if !self.match_token(TokenKind::Semicolon) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        let closing = self.expect(TokenKind::RBrace)?;
+        self.match_token(TokenKind::Semicolon);
+        Ok(StructDecl {
+            name: name.lexeme,
+            fields,
+            span: Span::new(start, closing.span.end),
+        })
     }
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
@@ -405,7 +478,13 @@ impl Parser {
                     let ty = Some(self.parse_type()?);
                     (name, start, VariableKind::MutableTyped, ty, true)
                 } else if self.match_token(TokenKind::DoubleColon) {
-                    (name, start, VariableKind::Immutable, None, false)
+                    let ty = if self.looks_like_typed_declaration() {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    let needs_equal = ty.is_some();
+                    (name, start, VariableKind::Immutable, ty, needs_equal)
                 } else {
                     return Err(ParseError::InvalidDeclaration { span: name.span });
                 }
@@ -472,6 +551,8 @@ impl Parser {
             TokenKind::Minus => Some(UnaryOp::Negate),
             TokenKind::Bang => Some(UnaryOp::Not),
             TokenKind::Tilde => Some(UnaryOp::BitwiseNot),
+            TokenKind::Ampersand => Some(UnaryOp::AddressOf),
+            TokenKind::Star => Some(UnaryOp::Dereference),
             _ => None,
         };
 
@@ -495,30 +576,94 @@ impl Parser {
         let mut expression = self.parse_primary_expression()?;
 
         loop {
+            if self.match_token(TokenKind::Dot) {
+                let field = self.expect_identifier()?;
+                let span = Span::new(expression.span().start, field.span.end);
+                expression = Expr::Field {
+                    base: Box::new(expression),
+                    name: field.lexeme,
+                    span,
+                };
+                continue;
+            }
+            if self.match_token(TokenKind::LBracket) {
+                let index = self.parse_expression()?;
+                let closing = self.expect(TokenKind::RBracket)?;
+                let span = Span::new(expression.span().start, closing.span.end);
+                expression = Expr::Index {
+                    base: Box::new(expression),
+                    index: Box::new(index),
+                    span,
+                };
+                continue;
+            }
             if !self.match_token(TokenKind::LParen) {
                 break;
             }
 
-            let mut arguments = Vec::new();
+            // Layout intrinsics take types, not runtime expressions.
+            if let Expr::Identifier {
+                name,
+                span: name_span,
+            } = &expression
+            {
+                if name == "size_of" || name == "align_of" {
+                    let ty = self.parse_type()?;
+                    let closing = self.expect(TokenKind::RParen)?;
+                    let span = Span::new(name_span.start, closing.span.end);
+                    expression = if name == "size_of" {
+                        Expr::SizeOf { ty, span }
+                    } else {
+                        Expr::AlignOf { ty, span }
+                    };
+                    continue;
+                }
+                if name == "offset_of" {
+                    let ty = self.parse_type()?;
+                    self.expect(TokenKind::Comma)?;
+                    let field = self.expect_identifier()?;
+                    let closing = self.expect(TokenKind::RParen)?;
+                    let span = Span::new(name_span.start, closing.span.end);
+                    expression = Expr::OffsetOf {
+                        ty,
+                        field: field.lexeme,
+                        span,
+                    };
+                    continue;
+                }
+            }
 
+            let mut arguments = Vec::new();
             if !self.at(TokenKind::RParen) {
                 loop {
                     arguments.push(self.parse_expression()?);
-
                     if !self.match_token(TokenKind::Comma) {
                         break;
                     }
-
                     if self.at(TokenKind::RParen) {
                         break;
                     }
                 }
             }
-
             let closing = self.expect(TokenKind::RParen)?;
-
             let span = Span::new(expression.span().start, closing.span.end);
-
+            if let Expr::Identifier { name, .. } = &expression {
+                if name == "unchecked_index" {
+                    if arguments.len() != 2 {
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "two arguments".into(),
+                            found: TokenKind::RParen,
+                            span: closing.span,
+                        });
+                    }
+                    expression = Expr::UncheckedIndex {
+                        base: Box::new(arguments.remove(0)),
+                        index: Box::new(arguments.remove(0)),
+                        span,
+                    };
+                    continue;
+                }
+            }
             expression = Expr::Call {
                 callee: Box::new(expression),
                 arguments,
@@ -577,12 +722,88 @@ impl Parser {
                 })
             }
 
+            TokenKind::Null => {
+                self.advance();
+                Ok(Expr::Null { span: token.span })
+            }
+
             TokenKind::Identifier => {
                 self.advance();
-
+                if self.at(TokenKind::LBrace)
+                    && (self.peek_kind(1) == Some(TokenKind::RBrace)
+                        || (self.peek_kind(1) == Some(TokenKind::Identifier)
+                            && self.peek_kind(2) == Some(TokenKind::Equal)))
+                {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        let field = self.expect_identifier()?;
+                        self.expect(TokenKind::Equal)?;
+                        let value = self.parse_expression()?;
+                        let span = Span::new(field.span.start, value.span().end);
+                        fields.push(StructInit {
+                            name: field.lexeme,
+                            value,
+                            span,
+                        });
+                        if !self.match_token(TokenKind::Comma)
+                            && !self.match_token(TokenKind::Semicolon)
+                            && !self.at(TokenKind::RBrace)
+                        {
+                            return Err(ParseError::UnexpectedToken {
+                                expected: "field separator".into(),
+                                found: self.current().kind,
+                                span: self.current().span,
+                            });
+                        }
+                    }
+                    let closing = self.expect(TokenKind::RBrace)?;
+                    return Ok(Expr::StructLiteral {
+                        name: token.lexeme,
+                        fields,
+                        span: Span::new(token.span.start, closing.span.end),
+                    });
+                }
                 Ok(Expr::Identifier {
                     name: token.lexeme,
                     span: token.span,
+                })
+            }
+
+            TokenKind::LBracket => {
+                self.advance();
+                let length_token = self.expect(TokenKind::Integer)?;
+                let length = length_token
+                    .lexeme
+                    .replace('_', "")
+                    .parse::<u64>()
+                    .map_err(|_| ParseError::InvalidInteger {
+                        lexeme: length_token.lexeme.clone(),
+                        span: length_token.span,
+                    })?;
+                self.expect(TokenKind::RBracket)?;
+                let element = self.parse_type()?;
+                self.expect(TokenKind::LBrace)?;
+                let mut elements = Vec::new();
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    elements.push(self.parse_expression()?);
+                    if !self.match_token(TokenKind::Comma) {
+                        self.expect(TokenKind::RBrace).map(|_| ())?;
+                        break;
+                    }
+                }
+                let closing = if self.previous().kind == TokenKind::RBrace {
+                    self.previous().clone()
+                } else {
+                    self.expect(TokenKind::RBrace)?
+                };
+                Ok(Expr::ArrayLiteral {
+                    ty: Type::Array {
+                        length,
+                        element: Box::new(element),
+                    },
+                    elements,
+                    span: Span::new(length_token.span.start - 1, closing.span.end),
                 })
             }
 
@@ -631,6 +852,30 @@ impl Parser {
 
             _ => None,
         }
+    }
+
+    fn looks_like_typed_declaration(&self) -> bool {
+        fn type_end(tokens: &[Token], position: usize) -> Option<usize> {
+            match tokens.get(position)?.kind {
+                TokenKind::Identifier => Some(position + 1),
+                TokenKind::Star => type_end(tokens, position + 1),
+                TokenKind::LBracket => {
+                    if tokens.get(position + 1)?.kind == TokenKind::RBracket {
+                        return type_end(tokens, position + 2);
+                    }
+                    if tokens.get(position + 1)?.kind != TokenKind::Integer
+                        || tokens.get(position + 2)?.kind != TokenKind::RBracket
+                    {
+                        return None;
+                    }
+                    type_end(tokens, position + 3)
+                }
+                _ => None,
+            }
+        }
+        type_end(&self.tokens, self.position)
+            .and_then(|end| self.tokens.get(end).map(|token| token.kind))
+            == Some(TokenKind::Equal)
     }
 
     fn current(&self) -> &Token {
@@ -737,7 +982,17 @@ impl BinaryOp {
 }
 
 fn is_assignable(expression: &Expr) -> bool {
-    matches!(expression, Expr::Identifier { .. })
+    matches!(
+        expression,
+        Expr::Identifier { .. }
+            | Expr::Field { .. }
+            | Expr::Index { .. }
+            | Expr::UncheckedIndex { .. }
+            | Expr::Unary {
+                operator: UnaryOp::Dereference,
+                ..
+            }
+    )
 }
 
 #[cfg(test)]
@@ -970,6 +1225,50 @@ mod tests {
         };
 
         assert_eq!(variable.kind, VariableKind::Immutable);
+    }
+
+    #[test]
+    fn parses_structs_arrays_fields_and_indices() {
+        let program = parse(
+            "Pair :: struct { x: i32; y: i32; } main :: () -> i32 { p := Pair{ x = 1, y = 2, }; xs := [2]i32{3, 4}; p.x = xs[1]; return p.x; }",
+        );
+        assert!(matches!(program.declarations[0], Decl::Struct(_)));
+        let Decl::Function(function) = &program.declarations[1] else {
+            panic!("expected function");
+        };
+        assert!(matches!(
+            function.body.statements[0],
+            Stmt::Variable(VariableDecl {
+                value: Expr::StructLiteral { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.body.statements[1],
+            Stmt::Variable(VariableDecl {
+                value: Expr::ArrayLiteral { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.body.statements[2],
+            Stmt::Assignment { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_empty_struct_literals() {
+        let program = parse("Empty :: struct {} main :: () { x := Empty{}; }");
+        let Decl::Function(function) = &program.declarations[1] else {
+            panic!("expected function");
+        };
+        assert!(matches!(
+            &function.body.statements[0],
+            Stmt::Variable(VariableDecl {
+                value: Expr::StructLiteral { fields, .. },
+                ..
+            }) if fields.is_empty()
+        ));
     }
 
     #[test]

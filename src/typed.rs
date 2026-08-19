@@ -1,29 +1,47 @@
 use crate::ast::{BinaryOp, UnaryOp};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    Size,
+    Align,
+    Offset,
+}
 use crate::lexer::Span;
 
-/// A primitive type after semantic resolution.  `Pointer` widths are resolved
-/// by the backend for the selected target, while signedness is retained here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegerWidth {
     Bits(u16),
     Pointer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedType {
     Unit,
     Bool,
-    Integer { width: IntegerWidth, signed: bool },
-    Float { bits: u16 },
+    Integer {
+        width: IntegerWidth,
+        signed: bool,
+    },
+    Float {
+        bits: u16,
+    },
+    Struct(String),
+    Array {
+        length: u64,
+        element: Box<ResolvedType>,
+    },
+    Pointer(Box<ResolvedType>),
+    Slice(Box<ResolvedType>),
 }
-
 impl ResolvedType {
-    pub fn is_integer(self) -> bool {
+    pub fn is_integer(&self) -> bool {
         matches!(self, Self::Integer { .. })
     }
-
-    pub fn is_signed_integer(self) -> bool {
+    pub fn is_signed_integer(&self) -> bool {
         matches!(self, Self::Integer { signed: true, .. })
+    }
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Self::Struct(_) | Self::Array { .. } | Self::Slice(_))
     }
 }
 
@@ -32,7 +50,35 @@ pub type LocalId = usize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProgram {
+    pub structs: Vec<TypedStruct>,
+    pub globals: Vec<TypedGlobal>,
+    pub constants: Vec<TypedConstant>,
     pub functions: Vec<TypedFunction>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedStruct {
+    pub name: String,
+    pub fields: Vec<TypedField>,
+    pub span: Span,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedField {
+    pub name: String,
+    pub ty: ResolvedType,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedGlobal {
+    pub name: String,
+    pub ty: ResolvedType,
+    pub value: TypedExpr,
+    pub span: Span,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedConstant {
+    pub name: String,
+    pub ty: ResolvedType,
+    pub value: TypedExpr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +90,6 @@ pub struct TypedFunction {
     pub body: TypedBlock,
     pub span: Span,
 }
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedParameter {
     pub id: LocalId,
@@ -52,11 +97,56 @@ pub struct TypedParameter {
     pub ty: ResolvedType,
     pub span: Span,
 }
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedBlock {
     pub statements: Vec<TypedStmt>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedPlace {
+    Local {
+        id: LocalId,
+        ty: ResolvedType,
+    },
+    Global {
+        name: String,
+        ty: ResolvedType,
+    },
+    /// A value expression materialized into storage so a nested field or
+    /// index can use the same address-based lowering as an lvalue.
+    Temporary {
+        value: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    Field {
+        base: Box<TypedPlace>,
+        index: u32,
+        ty: ResolvedType,
+    },
+    Index {
+        base: Box<TypedPlace>,
+        index: Box<TypedExpr>,
+        ty: ResolvedType,
+        length: Option<u64>,
+        checked: bool,
+    },
+    Dereference {
+        pointer: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+}
+impl TypedPlace {
+    pub fn ty(&self) -> ResolvedType {
+        match self {
+            Self::Local { ty, .. }
+            | Self::Global { ty, .. }
+            | Self::Temporary { ty, .. }
+            | Self::Field { ty, .. }
+            | Self::Index { ty, .. }
+            | Self::Dereference { ty, .. } => ty.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +181,7 @@ pub enum TypedStmt {
         span: Span,
     },
     Store {
-        id: LocalId,
+        target: TypedPlace,
         value: TypedExpr,
         ty: ResolvedType,
         span: Span,
@@ -119,11 +209,34 @@ pub enum TypedExpr {
         ty: ResolvedType,
         span: Span,
     },
-    /// A resolved local load.  The source name is retained for diagnostics,
-    /// but backends use `id`, never the spelling, to identify the binding.
+    StructLiteral {
+        ty: ResolvedType,
+        fields: Vec<TypedExpr>,
+        span: Span,
+    },
+    ArrayLiteral {
+        ty: ResolvedType,
+        elements: Vec<TypedExpr>,
+        span: Span,
+    },
     Load {
         id: LocalId,
         name: String,
+        ty: ResolvedType,
+        span: Span,
+    },
+    GlobalLoad {
+        name: String,
+        ty: ResolvedType,
+        span: Span,
+    },
+    Field {
+        place: TypedPlace,
+        ty: ResolvedType,
+        span: Span,
+    },
+    Index {
+        place: TypedPlace,
         ty: ResolvedType,
         span: Span,
     },
@@ -149,30 +262,67 @@ pub enum TypedExpr {
         ty: ResolvedType,
         span: Span,
     },
+    Null {
+        ty: ResolvedType,
+        span: Span,
+    },
+    AddressOf {
+        place: TypedPlace,
+        ty: ResolvedType,
+        span: Span,
+    },
+    Dereference {
+        place: TypedPlace,
+        ty: ResolvedType,
+        span: Span,
+    },
+    Layout {
+        kind: LayoutKind,
+        ty: ResolvedType,
+        target: ResolvedType,
+        field: Option<String>,
+        span: Span,
+    },
 }
-
 impl TypedExpr {
     pub fn ty(&self) -> ResolvedType {
         match self {
             Self::Integer { ty, .. }
             | Self::Float { ty, .. }
             | Self::Bool { ty, .. }
+            | Self::StructLiteral { ty, .. }
+            | Self::ArrayLiteral { ty, .. }
             | Self::Load { ty, .. }
+            | Self::GlobalLoad { ty, .. }
+            | Self::Field { ty, .. }
+            | Self::Index { ty, .. }
             | Self::Unary { ty, .. }
             | Self::Binary { ty, .. }
-            | Self::Call { ty, .. } => *ty,
+            | Self::Call { ty, .. }
+            | Self::Null { ty, .. }
+            | Self::AddressOf { ty, .. }
+            | Self::Dereference { ty, .. }
+            | Self::Layout { ty, .. } => ty.clone(),
         }
     }
-
     pub fn span(&self) -> Span {
         match self {
             Self::Integer { span, .. }
             | Self::Float { span, .. }
             | Self::Bool { span, .. }
+            | Self::StructLiteral { span, .. }
+            | Self::ArrayLiteral { span, .. }
             | Self::Load { span, .. }
+            | Self::GlobalLoad { span, .. }
+            | Self::Field { span, .. }
+            | Self::Index { span, .. }
             | Self::Unary { span, .. }
             | Self::Binary { span, .. }
-            | Self::Call { span, .. } => *span,
+            | Self::Call { span, .. }
+            | Self::Null { span, .. }
+            | Self::AddressOf { span, .. }
+            | Self::Dereference { span, .. }
+            | Self::Layout { span, .. } => *span,
         }
     }
 }

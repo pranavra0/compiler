@@ -9,6 +9,21 @@ pub struct Program {
 pub enum Decl {
     Function(FunctionDecl),
     Variable(VariableDecl),
+    Struct(StructDecl),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructField {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,9 +46,9 @@ pub struct VariableDecl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariableKind {
-    MutableInferred, // :=
-    MutableTyped,    // : T =
-    Immutable,       // :: expr
+    MutableInferred,
+    MutableTyped,
+    Immutable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,34 +72,27 @@ pub enum Stmt {
         else_branch: Option<Block>,
         span: Span,
     },
-
     While {
         condition: Expr,
         body: Block,
         span: Span,
     },
-
     Break {
         span: Span,
     },
-
     Continue {
         span: Span,
     },
-
     Return {
         value: Option<Expr>,
         span: Span,
     },
-
     Variable(VariableDecl),
-
     Assignment {
         target: Expr,
         value: Expr,
         span: Span,
     },
-
     Expr {
         expression: Expr,
         span: Span,
@@ -97,35 +105,70 @@ pub enum Expr {
         value: i128,
         span: Span,
     },
-
     Float {
         value: f64,
         span: Span,
     },
-
     Bool {
         value: bool,
         span: Span,
     },
-
+    Null {
+        span: Span,
+    },
+    SizeOf {
+        ty: Type,
+        span: Span,
+    },
+    AlignOf {
+        ty: Type,
+        span: Span,
+    },
+    OffsetOf {
+        ty: Type,
+        field: String,
+        span: Span,
+    },
+    UncheckedIndex {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     Identifier {
         name: String,
         span: Span,
     },
-
+    StructLiteral {
+        name: String,
+        fields: Vec<StructInit>,
+        span: Span,
+    },
+    ArrayLiteral {
+        ty: Type,
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    Field {
+        base: Box<Expr>,
+        name: String,
+        span: Span,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     Unary {
         operator: UnaryOp,
         operand: Box<Expr>,
         span: Span,
     },
-
     Binary {
         left: Box<Expr>,
         operator: BinaryOp,
         right: Box<Expr>,
         span: Span,
     },
-
     Call {
         callee: Box<Expr>,
         arguments: Vec<Expr>,
@@ -133,16 +176,32 @@ pub enum Expr {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructInit {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::Integer { span, .. } => *span,
-            Expr::Float { span, .. } => *span,
-            Expr::Bool { span, .. } => *span,
-            Expr::Identifier { span, .. } => *span,
-            Expr::Unary { span, .. } => *span,
-            Expr::Binary { span, .. } => *span,
-            Expr::Call { span, .. } => *span,
+            Expr::Integer { span, .. }
+            | Expr::Float { span, .. }
+            | Expr::Bool { span, .. }
+            | Expr::Null { span }
+            | Expr::SizeOf { span, .. }
+            | Expr::AlignOf { span, .. }
+            | Expr::OffsetOf { span, .. }
+            | Expr::UncheckedIndex { span, .. }
+            | Expr::Identifier { span, .. }
+            | Expr::StructLiteral { span, .. }
+            | Expr::ArrayLiteral { span, .. }
+            | Expr::Field { span, .. }
+            | Expr::Index { span, .. }
+            | Expr::Unary { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::Call { span, .. } => *span,
         }
     }
 }
@@ -152,6 +211,8 @@ pub enum UnaryOp {
     Negate,
     Not,
     BitwiseNot,
+    AddressOf,
+    Dereference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,17 +222,14 @@ pub enum BinaryOp {
     Multiply,
     Divide,
     Modulo,
-
     Equal,
     NotEqual,
     Less,
     LessEqual,
     Greater,
     GreaterEqual,
-
     LogicalAnd,
     LogicalOr,
-
     BitwiseAnd,
     BitwiseOr,
     BitwiseXor,
@@ -183,4 +241,7 @@ pub enum BinaryOp {
 pub enum Type {
     Unit,
     Named(String),
+    Array { length: u64, element: Box<Type> },
+    Pointer(Box<Type>),
+    Slice(Box<Type>),
 }

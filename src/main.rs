@@ -142,9 +142,8 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
         )
         .ok_or_else(|| "could not create the native LLVM target machine".to_string())?;
     let target_data = target_machine.get_target_data();
-    let pointer_width = target_data.get_pointer_byte_size(None) * 8;
     let context = Context::create();
-    let module = CodeGenerator::with_pointer_width(&context, module_name(&output), pointer_width)
+    let module = CodeGenerator::with_target_data(&context, module_name(&output), &target_data)
         .generate_typed(&typed)
         .map_err(|error| format!("error: code generation error: {error}"))?;
     module.set_triple(&target_triple);

@@ -1,0 +1,84 @@
+// A small systems-style memory exercise. There is no allocator or ownership
+// machinery here: the slice borrows the local array and raw pointers are used
+// explicitly.
+Pair :: struct {
+    tag: i8;
+    value: i32;
+}
+
+layout_valid :: () -> bool {
+    return size_of(Pair) > 0
+        && align_of(Pair) > 0
+        && offset_of(Pair, value) < size_of(Pair)
+        && size_of([]u8) == size_of(*u8) + size_of(usize)
+        && align_of([]u8) == align_of(*u8);
+}
+
+read_at :: (p: *i32) -> i32 {
+    return *p;
+}
+
+pointer_ops :: () -> i32 {
+    values := [3]i32{1, 2, 3};
+    first := &values[0];
+    second := first + 1;
+    third := first + 2;
+    back := second - 1;
+
+    *second = 20;
+    return read_at(back) + read_at(second) + read_at(third);
+}
+
+pointer_order :: () -> bool {
+    values := [2]i32{10, 20};
+    first := &values[0];
+    second := first + 1;
+    return first != second && first < second;
+}
+
+null_pointer_is_null :: () -> bool {
+    p: *i32 = null;
+    return p == null;
+}
+
+pointer_distance :: () -> isize {
+    values := [2]i32{10, 20};
+    first := &values[0];
+    second := first + 1;
+    return second - first;
+}
+
+slice_ops :: () -> i32 {
+    values := [4]i32{1, 2, 3, 4};
+    view := make_slice(&values[0], 4);
+    alias := view; // slices are ordinary two-word values
+    index: usize = 2;
+
+    view[index] = 30;                 // checked dynamic indexing
+    unchecked_index(view, 1) = 20;   // explicitly unchecked lvalue
+    unchecked_index(values, 0) = 10;  // explicitly unchecked array access
+
+    return view[0] + alias[1] + view[2] + view[3];
+}
+
+empty_slice :: () -> []u8 {
+    return make_slice(null, 0);
+}
+
+main :: () -> i32 {
+    if !layout_valid() {
+        return 1;
+    }
+    if !pointer_order() {
+        return 2;
+    }
+    if pointer_distance() != 1 {
+        return 3;
+    }
+    if !null_pointer_is_null() {
+        return 4;
+    }
+
+    empty_slice();
+    return pointer_ops() + slice_ops();
+}

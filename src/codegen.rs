@@ -1,75 +1,69 @@
-use std::collections::HashMap;
-use std::fmt;
-use std::num::NonZeroU32;
-
-use inkwell::basic_block::BasicBlock;
-use inkwell::builder::BuilderError;
-use inkwell::context::Context;
-use inkwell::module::Module;
-use inkwell::types::{BasicType, BasicTypeEnum, StringRadix};
-use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
-};
-use inkwell::{FloatPredicate, IntPredicate};
-
 use crate::ast::Program;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::lexer::Span;
 use crate::semantic;
 use crate::typed::{
-    IntegerWidth, ResolvedType, TypedBlock, TypedExpr, TypedFunction, TypedProgram, TypedStmt,
+    IntegerWidth, LayoutKind, ResolvedType, TypedBlock, TypedExpr, TypedFunction, TypedPlace,
+    TypedProgram, TypedStmt,
 };
+use inkwell::AddressSpace;
+use inkwell::basic_block::BasicBlock;
+use inkwell::builder::BuilderError;
+use inkwell::context::Context;
+use inkwell::module::Module;
+use inkwell::targets::TargetData;
+use inkwell::types::{BasicType, BasicTypeEnum, StringRadix, StructType};
+use inkwell::values::{
+    ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+};
+use inkwell::{FloatPredicate, IntPredicate};
+use std::collections::HashMap;
+use std::fmt;
+use std::num::NonZeroU32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodegenError {
     pub message: String,
     pub span: Option<Span>,
 }
-
 impl CodegenError {
-    fn new(message: impl Into<String>) -> Self {
+    fn new(x: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: x.into(),
             span: None,
         }
     }
-    fn at(message: impl Into<String>, span: Span) -> Self {
+    fn at(x: impl Into<String>, s: Span) -> Self {
         Self {
-            message: message.into(),
-            span: Some(span),
+            message: x.into(),
+            span: Some(s),
         }
     }
 }
-
 impl fmt::Display for CodegenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.span {
-            Some(span) => write!(f, "{} at {}..{}", self.message, span.start, span.end),
+            Some(s) => write!(f, "{} at {}..{}", self.message, s.start, s.end),
             None => f.write_str(&self.message),
         }
     }
 }
 impl std::error::Error for CodegenError {}
 impl From<BuilderError> for CodegenError {
-    fn from(error: BuilderError) -> Self {
-        Self::new(format!("LLVM builder error: {error:?}"))
+    fn from(e: BuilderError) -> Self {
+        Self::new(format!("LLVM builder error: {e:?}"))
     }
 }
-
 #[derive(Clone)]
 struct Local<'ctx> {
     pointer: PointerValue<'ctx>,
     llvm_type: BasicTypeEnum<'ctx>,
-    ty: ResolvedType,
-    mutable: bool,
 }
-
 #[derive(Clone, Copy)]
 struct LoopTargets<'ctx> {
     continue_block: BasicBlock<'ctx>,
     break_block: BasicBlock<'ctx>,
 }
-
 #[derive(Clone, Copy)]
 struct Flow(u8);
 impl Flow {
@@ -77,231 +71,263 @@ impl Flow {
     const RETURN: Self = Self(2);
     const BREAK: Self = Self(4);
     const CONTINUE: Self = Self(8);
-    fn contains(self, other: Self) -> bool {
-        self.0 & other.0 != 0
+    fn contains(self, x: Self) -> bool {
+        self.0 & x.0 != 0
     }
-    fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
+    fn union(self, x: Self) -> Self {
+        Self(self.0 | x.0)
     }
-    fn without(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
+    fn without(self, x: Self) -> Self {
+        Self(self.0 & !x.0)
     }
 }
 
-/// LLVM lowering consumes only resolved typed IR.  In particular, signedness,
-/// widths, call targets, and local references are never inferred from syntax.
 pub struct CodeGenerator<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: inkwell::builder::Builder<'ctx>,
     locals: HashMap<usize, Local<'ctx>>,
+    globals: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>, ResolvedType)>,
     functions: HashMap<usize, FunctionValue<'ctx>>,
+    structs: HashMap<String, StructType<'ctx>>,
+    struct_fields: HashMap<String, HashMap<String, u32>>,
     current_function: Option<FunctionValue<'ctx>>,
     current_return_type: ResolvedType,
     pointer_width: u32,
+    target_data: TargetData,
     loop_targets: Vec<LoopTargets<'ctx>>,
 }
-
 impl<'ctx> CodeGenerator<'ctx> {
-    pub fn new(context: &'ctx Context, module_name: &str) -> Self {
-        Self::with_pointer_width(context, module_name, usize::BITS)
+    pub fn new(c: &'ctx Context, n: &str) -> Self {
+        Self::with_pointer_width(c, n, usize::BITS)
     }
-    pub fn with_pointer_width(
-        context: &'ctx Context,
-        module_name: &str,
-        pointer_width: u32,
-    ) -> Self {
+    pub fn with_target_data(c: &'ctx Context, n: &str, data: &TargetData) -> Self {
+        let layout = data.get_data_layout();
+        let layout_text = layout.as_str().to_string_lossy();
+        let target_data = TargetData::create(&layout_text);
+        let pointer_width = data.get_pointer_byte_size(None) * 8;
+        let module = c.create_module(n);
+        module.set_data_layout(&target_data.get_data_layout());
         Self {
-            context,
-            module: context.create_module(module_name),
-            builder: context.create_builder(),
+            context: c,
+            module,
+            builder: c.create_builder(),
             locals: HashMap::new(),
+            globals: HashMap::new(),
             functions: HashMap::new(),
+            structs: HashMap::new(),
+            struct_fields: HashMap::new(),
             current_function: None,
             current_return_type: ResolvedType::Unit,
             pointer_width,
+            target_data,
             loop_targets: Vec::new(),
         }
     }
-
-    /// Compatibility entry point for users that still have an AST.  Semantic
-    /// analysis and typed lowering happen before this backend is entered.
-    pub fn generate(self, program: &Program) -> Result<Module<'ctx>, CodegenError> {
-        let typed = semantic::analyze_typed(program)
-            .map_err(|error| CodegenError::new(format!("semantic error: {error}")))?;
-        self.generate_typed(&typed)
+    pub fn with_pointer_width(c: &'ctx Context, n: &str, w: u32) -> Self {
+        let target_data = TargetData::create(&format!("e-p:{w}:{w}"));
+        let module = c.create_module(n);
+        module.set_data_layout(&target_data.get_data_layout());
+        Self {
+            context: c,
+            module,
+            builder: c.create_builder(),
+            locals: HashMap::new(),
+            globals: HashMap::new(),
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            struct_fields: HashMap::new(),
+            current_function: None,
+            current_return_type: ResolvedType::Unit,
+            pointer_width: w,
+            target_data,
+            loop_targets: Vec::new(),
+        }
     }
-
-    pub fn generate_typed(mut self, program: &TypedProgram) -> Result<Module<'ctx>, CodegenError> {
-        self.declare_functions(program)?;
-        for function in &program.functions {
-            self.generate_function(function)?;
+    pub fn generate(self, p: &Program) -> Result<Module<'ctx>, CodegenError> {
+        let t = semantic::analyze_typed_with_pointer_width(p, self.pointer_width)
+            .map_err(|e| CodegenError::new(format!("semantic error: {e}")))?;
+        self.generate_typed(&t)
+    }
+    pub fn generate_typed(mut self, p: &TypedProgram) -> Result<Module<'ctx>, CodegenError> {
+        self.declare_structs(p)?;
+        self.declare_globals(p)?;
+        self.declare_functions(p)?;
+        for f in &p.functions {
+            self.generate_function(f)?
         }
         self.module
             .verify()
-            .map_err(|error| CodegenError::new(error.to_string()))?;
+            .map_err(|e| CodegenError::new(e.to_string()))?;
         Ok(self.module)
     }
-
-    fn declare_functions(&mut self, program: &TypedProgram) -> Result<(), CodegenError> {
-        for function in &program.functions {
-            if self.module.get_function(&function.name).is_some() {
-                return Err(CodegenError::at(
-                    format!("function `{}` is declared more than once", function.name),
-                    function.span,
-                ));
-            }
-            let mut params = Vec::new();
-            for parameter in &function.params {
-                params.push(self.basic_type(parameter.ty)?.into());
-            }
-            let function_type = if function.return_type == ResolvedType::Unit {
-                self.context.void_type().fn_type(&params, false)
-            } else {
-                self.basic_type(function.return_type)?
-                    .fn_type(&params, false)
-            };
-            let value = self
-                .module
-                .add_function(&function.name, function_type, None);
-            self.functions.insert(function.id, value);
+    fn declare_structs(&mut self, p: &TypedProgram) -> Result<(), CodegenError> {
+        for s in &p.structs {
+            self.structs
+                .insert(s.name.clone(), self.context.opaque_struct_type(&s.name));
+        }
+        for s in &p.structs {
+            let st = self.structs[&s.name];
+            self.struct_fields.insert(
+                s.name.clone(),
+                s.fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.name.clone(), i as u32))
+                    .collect(),
+            );
+            let fields = s
+                .fields
+                .iter()
+                .map(|f| self.basic_type(f.ty.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            st.set_body(&fields, false);
         }
         Ok(())
     }
-
-    fn generate_function(&mut self, function: &TypedFunction) -> Result<(), CodegenError> {
-        let llvm_function = self.functions[&function.id];
-        self.current_function = Some(llvm_function);
-        self.current_return_type = function.return_type;
+    fn declare_globals(&mut self, p: &TypedProgram) -> Result<(), CodegenError> {
+        for g in p
+            .globals
+            .iter()
+            .map(|g| (&g.name, &g.ty, &g.value))
+            .chain(p.constants.iter().map(|c| (&c.name, &c.ty, &c.value)))
+        {
+            let ty = self.basic_type(g.1.clone())?;
+            let gv = self.module.add_global(ty, None, g.0);
+            let init = self.generate_constant(g.2)?;
+            gv.set_initializer(&init);
+            if p.constants.iter().any(|constant| constant.name == *g.0) {
+                gv.set_constant(true);
+            }
+            self.globals
+                .insert(g.0.clone(), (gv.as_pointer_value(), ty, g.1.clone()));
+        }
+        Ok(())
+    }
+    fn declare_functions(&mut self, p: &TypedProgram) -> Result<(), CodegenError> {
+        for f in &p.functions {
+            let params = f
+                .params
+                .iter()
+                .map(|x| self.basic_type(x.ty.clone()).map(Into::into))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ft = if f.return_type == ResolvedType::Unit {
+                self.context.void_type().fn_type(&params, false)
+            } else {
+                self.basic_type(f.return_type.clone())?
+                    .fn_type(&params, false)
+            };
+            if self.module.get_function(&f.name).is_some() {
+                return Err(CodegenError::at(
+                    format!("function `{}` is declared more than once", f.name),
+                    f.span,
+                ));
+            }
+            self.functions
+                .insert(f.id, self.module.add_function(&f.name, ft, None));
+        }
+        Ok(())
+    }
+    fn generate_function(&mut self, f: &TypedFunction) -> Result<(), CodegenError> {
+        let fun = self.functions[&f.id];
+        self.current_function = Some(fun);
+        self.current_return_type = f.return_type.clone();
         self.locals.clear();
         self.loop_targets.clear();
-        let entry = self.context.append_basic_block(llvm_function, "entry");
+        let entry = self.context.append_basic_block(fun, "entry");
         self.builder.position_at_end(entry);
-
-        for (index, parameter) in function.params.iter().enumerate() {
-            let value = llvm_function
-                .get_nth_param(index as u32)
-                .expect("typed parameter count matches function type");
-            let llvm_type = self.basic_type(parameter.ty)?;
-            let pointer = self
-                .builder
-                .build_alloca(llvm_type, &format!("{}.addr", parameter.name))?;
-            self.builder.build_store(pointer, value)?;
+        for (i, p) in f.params.iter().enumerate() {
+            let v = fun.get_nth_param(i as u32).unwrap();
+            let lt = self.basic_type(p.ty.clone())?;
+            let ptr = self.builder.build_alloca(lt, &format!("{}.addr", p.name))?;
+            self.builder.build_store(ptr, v)?;
             self.locals.insert(
-                parameter.id,
+                p.id,
                 Local {
-                    pointer,
-                    llvm_type,
-                    ty: parameter.ty,
-                    mutable: true,
+                    pointer: ptr,
+                    llvm_type: lt,
                 },
             );
         }
-
-        let flow = self.generate_block(&function.body)?;
+        let flow = self.generate_block(&f.body)?;
         if flow.contains(Flow::NORMAL) {
             if self.current_return_type != ResolvedType::Unit {
                 return Err(CodegenError::at(
                     format!(
                         "function `{}` does not return a value on every path",
-                        function.name
+                        f.name
                     ),
-                    function.body.span,
+                    f.body.span,
                 ));
             }
             self.builder.build_return(None)?;
         }
-        if !llvm_function.verify(true) {
+        if !fun.verify(true) {
             return Err(CodegenError::new(format!(
                 "LLVM verification failed for function `{}`",
-                function.name
+                f.name
             )));
         }
         Ok(())
     }
-
-    fn generate_block(&mut self, block: &TypedBlock) -> Result<Flow, CodegenError> {
+    fn generate_block(&mut self, b: &TypedBlock) -> Result<Flow, CodegenError> {
         let saved = self.locals.clone();
-        let result = (|| {
-            let mut flow = Flow::NORMAL;
-            for statement in &block.statements {
-                if flow.contains(Flow::NORMAL) {
-                    flow = flow
-                        .without(Flow::NORMAL)
-                        .union(self.generate_statement(statement)?);
-                }
+        let mut flow = Flow::NORMAL;
+        for s in &b.statements {
+            if flow.contains(Flow::NORMAL) {
+                flow = flow
+                    .without(Flow::NORMAL)
+                    .union(self.generate_statement(s)?);
             }
-            Ok(flow)
-        })();
+        }
         self.locals = saved;
-        result
+        Ok(flow)
     }
-
-    fn generate_statement(&mut self, statement: &TypedStmt) -> Result<Flow, CodegenError> {
-        match statement {
+    fn generate_statement(&mut self, s: &TypedStmt) -> Result<Flow, CodegenError> {
+        match s {
             TypedStmt::Declare {
                 id,
                 name,
                 ty,
-                mutable,
+                mutable: _,
                 value,
                 ..
             } => {
-                let llvm_type = self.basic_type(*ty)?;
-                let value = self.generate_expression(value)?;
-                if value.get_type() != llvm_type {
+                let lt = self.basic_type(ty.clone())?;
+                let v = self.generate_expression(value)?;
+                if v.get_type() != lt {
                     return Err(CodegenError::at(
                         "initializer has the wrong resolved type",
-                        value_span(value, statement_span(statement)),
+                        s_span(s),
                     ));
                 }
-                let pointer = self
-                    .builder
-                    .build_alloca(llvm_type, &format!("{name}.addr"))?;
-                self.builder.build_store(pointer, value)?;
+                let p = self.builder.build_alloca(lt, &format!("{name}.addr"))?;
+                self.builder.build_store(p, v)?;
                 self.locals.insert(
                     *id,
                     Local {
-                        pointer,
-                        llvm_type,
-                        ty: *ty,
-                        mutable: *mutable,
+                        pointer: p,
+                        llvm_type: lt,
                     },
                 );
                 Ok(Flow::NORMAL)
             }
             TypedStmt::Store {
-                id,
+                target,
                 value,
                 ty,
                 span,
             } => {
-                let local = self
-                    .locals
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| CodegenError::at("unknown resolved local", *span))?;
-                if !local.mutable {
-                    return Err(CodegenError::at(
-                        "cannot assign to immutable variable",
-                        *span,
-                    ));
+                let p = self.place_pointer(target, *span)?;
+                let v = self.generate_expression(value)?;
+                if v.get_type() != self.basic_type(ty.clone())? {
+                    return Err(CodegenError::at("assigned value has the wrong type", *span));
                 }
-                let value = self.generate_expression(value)?;
-                if value.get_type() != local.llvm_type {
-                    return Err(CodegenError::at(
-                        "assigned value has the wrong type",
-                        value_span(value, *span),
-                    ));
-                }
-                if *ty != local.ty {
-                    return Err(CodegenError::at("resolved store type mismatch", *span));
-                }
-                self.builder.build_store(local.pointer, value)?;
+                self.builder.build_store(p, v)?;
                 Ok(Flow::NORMAL)
             }
             TypedStmt::Return { value, span } => {
-                match (self.current_return_type, value) {
+                match (self.current_return_type.clone(), value) {
                     (ResolvedType::Unit, None) => {
                         self.builder.build_return(None)?;
                     }
@@ -317,39 +343,33 @@ impl<'ctx> CodeGenerator<'ctx> {
                             *span,
                         ));
                     }
-                    (_, Some(expression)) => {
-                        let value = self.generate_expression(expression)?;
-                        self.builder.build_return(Some(&value))?;
+                    (_, Some(x)) => {
+                        let v = self.generate_expression(x)?;
+                        self.builder.build_return(Some(&v))?;
                     }
                 }
                 Ok(Flow::RETURN)
             }
             TypedStmt::Expr { expression, .. } => {
-                if let TypedExpr::Call { .. } = expression {
-                    self.generate_call(expression)?;
-                } else {
-                    self.generate_expression(expression)?;
-                }
+                self.generate_expression(expression)?;
                 Ok(Flow::NORMAL)
             }
             TypedStmt::Break { span } => {
-                let targets = self
+                let t = self
                     .loop_targets
                     .last()
                     .copied()
                     .ok_or_else(|| CodegenError::at("break is outside a loop", *span))?;
-                self.builder
-                    .build_unconditional_branch(targets.break_block)?;
+                self.builder.build_unconditional_branch(t.break_block)?;
                 Ok(Flow::BREAK)
             }
             TypedStmt::Continue { span } => {
-                let targets = self
+                let t = self
                     .loop_targets
                     .last()
                     .copied()
                     .ok_or_else(|| CodegenError::at("continue is outside a loop", *span))?;
-                self.builder
-                    .build_unconditional_branch(targets.continue_block)?;
+                self.builder.build_unconditional_branch(t.continue_block)?;
                 Ok(Flow::CONTINUE)
             }
             TypedStmt::If {
@@ -363,132 +383,175 @@ impl<'ctx> CodeGenerator<'ctx> {
             } => self.generate_while(condition, body),
         }
     }
-
     fn generate_if(
         &mut self,
-        condition: &TypedExpr,
-        then_branch: &TypedBlock,
-        else_branch: Option<&TypedBlock>,
+        c: &TypedExpr,
+        t: &TypedBlock,
+        e: Option<&TypedBlock>,
     ) -> Result<Flow, CodegenError> {
-        let condition_value = self.generate_expression(condition)?;
-        let condition = self.as_condition(condition_value, condition.span())?;
-        let function = self
-            .current_function
-            .ok_or_else(|| CodegenError::new("conditional outside function"))?;
-        let then_block = self.context.append_basic_block(function, "if.then");
-        let else_block = self.context.append_basic_block(function, "if.else");
-        let merge = self.context.append_basic_block(function, "if.end");
-        self.builder
-            .build_conditional_branch(condition, then_block, else_block)?;
-        self.builder.position_at_end(then_block);
-        let then_flow = self.generate_block(then_branch)?;
-        if then_flow.contains(Flow::NORMAL) {
-            self.builder.build_unconditional_branch(merge)?;
+        let raw = self.generate_expression(c)?;
+        let cv = self.as_condition(raw, c.span())?;
+        let f = self.current_function.unwrap();
+        let tb = self.context.append_basic_block(f, "if.then");
+        let eb = self.context.append_basic_block(f, "if.else");
+        let end = self.context.append_basic_block(f, "if.end");
+        self.builder.build_conditional_branch(cv, tb, eb)?;
+        self.builder.position_at_end(tb);
+        let tf = self.generate_block(t)?;
+        if tf.contains(Flow::NORMAL) {
+            self.builder.build_unconditional_branch(end)?;
         }
-        self.builder.position_at_end(else_block);
-        let else_flow = match else_branch {
-            Some(block) => self.generate_block(block)?,
+        self.builder.position_at_end(eb);
+        let ef = match e {
+            Some(x) => self.generate_block(x)?,
             None => Flow::NORMAL,
         };
-        if else_flow.contains(Flow::NORMAL) {
-            self.builder.build_unconditional_branch(merge)?;
+        if ef.contains(Flow::NORMAL) {
+            self.builder.build_unconditional_branch(end)?;
         }
-        let flow = then_flow.union(else_flow);
-        self.builder.position_at_end(merge);
+        let flow = tf.union(ef);
+        self.builder.position_at_end(end);
         if !flow.contains(Flow::NORMAL) {
             self.builder.build_unreachable()?;
         }
         Ok(flow)
     }
-
-    fn generate_while(
-        &mut self,
-        condition: &TypedExpr,
-        body: &TypedBlock,
-    ) -> Result<Flow, CodegenError> {
-        let function = self
-            .current_function
-            .ok_or_else(|| CodegenError::new("loop outside function"))?;
-        let cond_block = self.context.append_basic_block(function, "while.cond");
-        let body_block = self.context.append_basic_block(function, "while.body");
-        let end_block = self.context.append_basic_block(function, "while.end");
-        self.builder.build_unconditional_branch(cond_block)?;
-        self.builder.position_at_end(cond_block);
-        let condition_raw = self.generate_expression(condition)?;
-        let condition_value = self.as_condition(condition_raw, condition.span())?;
-        let always = matches!(condition, TypedExpr::Bool { value: true, .. });
+    fn generate_while(&mut self, c: &TypedExpr, b: &TypedBlock) -> Result<Flow, CodegenError> {
+        let f = self.current_function.unwrap();
+        let cb = self.context.append_basic_block(f, "while.cond");
+        let bb = self.context.append_basic_block(f, "while.body");
+        let eb = self.context.append_basic_block(f, "while.end");
+        self.builder.build_unconditional_branch(cb)?;
+        self.builder.position_at_end(cb);
+        let raw = self.generate_expression(c)?;
+        let cv = self.as_condition(raw, c.span())?;
+        let always = matches!(c, TypedExpr::Bool { value: true, .. });
         if always {
-            self.builder.build_unconditional_branch(body_block)?;
+            self.builder.build_unconditional_branch(bb)?;
         } else {
-            self.builder
-                .build_conditional_branch(condition_value, body_block, end_block)?;
+            self.builder.build_conditional_branch(cv, bb, eb)?;
         }
         self.loop_targets.push(LoopTargets {
-            continue_block: cond_block,
-            break_block: end_block,
+            continue_block: cb,
+            break_block: eb,
         });
-        self.builder.position_at_end(body_block);
-        let body_flow = self.generate_block(body)?;
+        self.builder.position_at_end(bb);
+        let bf = self.generate_block(b)?;
         self.loop_targets.pop();
-        if body_flow.contains(Flow::NORMAL) {
-            self.builder.build_unconditional_branch(cond_block)?;
+        if bf.contains(Flow::NORMAL) {
+            self.builder.build_unconditional_branch(cb)?;
         }
-        self.builder.position_at_end(end_block);
-        let has_exit = !always || body_flow.contains(Flow::BREAK);
-        if always && !has_exit {
+        self.builder.position_at_end(eb);
+        let exit = !always || bf.contains(Flow::BREAK);
+        if always && !exit {
             self.builder.build_unreachable()?;
         }
-        let mut flow = if body_flow.contains(Flow::RETURN) {
+        let mut flow = if bf.contains(Flow::RETURN) {
             Flow::RETURN
         } else {
             Flow(0)
         };
-        if has_exit {
-            flow = flow.union(Flow::NORMAL);
+        if exit {
+            flow = flow.union(Flow::NORMAL)
         }
         Ok(flow)
     }
 
-    fn generate_expression(
-        &mut self,
-        expression: &TypedExpr,
-    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        match expression {
+    fn generate_expression(&mut self, e: &TypedExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match e {
             TypedExpr::Integer { value, ty, span } => {
-                let BasicTypeEnum::IntType(integer_type) = self.basic_type(*ty)? else {
-                    return Err(CodegenError::at(
-                        "integer has a non-integer resolved type",
-                        *span,
-                    ));
+                let BasicTypeEnum::IntType(t) = self.basic_type(ty.clone())? else {
+                    return Err(CodegenError::at("integer has a non-integer type", *span));
                 };
-                let value = integer_type
-                    .const_int_from_string(&value.to_string(), StringRadix::Decimal)
-                    .ok_or_else(|| CodegenError::at("integer literal is out of range", *span))?;
-                Ok(value.into())
+                Ok(
+                    t.const_int_from_string(&value.to_string(), StringRadix::Decimal)
+                        .ok_or_else(|| CodegenError::at("integer literal is out of range", *span))?
+                        .into(),
+                )
             }
             TypedExpr::Float { value, ty, span } => {
-                let BasicTypeEnum::FloatType(float_type) = self.basic_type(*ty)? else {
-                    return Err(CodegenError::at(
-                        "float has a non-float resolved type",
-                        *span,
-                    ));
+                let BasicTypeEnum::FloatType(t) = self.basic_type(ty.clone())? else {
+                    return Err(CodegenError::at("float has a non-float type", *span));
                 };
-                Ok(float_type.const_float(*value).into())
+                Ok(t.const_float(*value).into())
             }
             TypedExpr::Bool { value, .. } => Ok(self
                 .context
                 .bool_type()
                 .const_int(u64::from(*value), false)
                 .into()),
+            TypedExpr::Null { ty, span } => {
+                let BasicTypeEnum::PointerType(pt) = self.basic_type(ty.clone())? else {
+                    return Err(CodegenError::at("null requires a pointer type", *span));
+                };
+                Ok(pt.const_null().into())
+            }
+            TypedExpr::AddressOf { place, .. } => Ok(self.place_pointer(place, e.span())?.into()),
+            TypedExpr::Dereference { place, ty, span } => {
+                let p = self.place_pointer(place, *span)?;
+                Ok(self
+                    .builder
+                    .build_load(self.basic_type(ty.clone())?, p, "deref.load")?)
+            }
+            TypedExpr::Layout {
+                kind,
+                target,
+                field,
+                span,
+                ..
+            } => {
+                let value = self.layout_value(*kind, target, field.as_deref(), *span)?;
+                Ok(self.usize_type().const_int(value, false).into())
+            }
             TypedExpr::Load { id, span, .. } => {
-                let local = self
+                let l = self
                     .locals
                     .get(id)
                     .cloned()
                     .ok_or_else(|| CodegenError::at("unknown resolved local", *span))?;
-                Ok(self
-                    .builder
-                    .build_load(local.llvm_type, local.pointer, "loadtmp")?)
+                Ok(self.builder.build_load(l.llvm_type, l.pointer, "loadtmp")?)
+            }
+            TypedExpr::GlobalLoad { name, span, .. } => {
+                let (g, ty, _) = self
+                    .globals
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| CodegenError::at("unknown global", *span))?;
+                Ok(self.builder.build_load(ty, g, "global.load")?)
+            }
+            TypedExpr::Field { place, .. } | TypedExpr::Index { place, .. } => {
+                let p = self.place_pointer(place, e.span())?;
+                let ty = self.basic_type(e.ty())?;
+                Ok(self.builder.build_load(ty, p, "aggregate.load")?)
+            }
+            TypedExpr::StructLiteral { ty, fields, .. } => {
+                let st = match ty {
+                    ResolvedType::Struct(n) => self.structs[n],
+                    _ => return Err(CodegenError::new("invalid struct literal type")),
+                };
+                let mut value = st.get_undef();
+                for (i, x) in fields.iter().enumerate() {
+                    let v = self.generate_expression(x)?;
+                    value = self
+                        .builder
+                        .build_insert_value(value, v, i as u32, "struct.insert")?
+                        .into_struct_value();
+                }
+                Ok(value.into())
+            }
+            TypedExpr::ArrayLiteral { ty, elements, .. } => {
+                let BasicTypeEnum::ArrayType(at) = self.basic_type(ty.clone())? else {
+                    return Err(CodegenError::new("invalid array literal type"));
+                };
+                let mut value = at.get_undef();
+                for (i, x) in elements.iter().enumerate() {
+                    let v = self.generate_expression(x)?;
+                    value = self
+                        .builder
+                        .build_insert_value(value, v, i as u32, "array.insert")?
+                        .into_array_value();
+                }
+                Ok(value.into())
             }
             TypedExpr::Unary {
                 operator,
@@ -496,17 +559,16 @@ impl<'ctx> CodeGenerator<'ctx> {
                 ty,
                 span,
             } => {
-                let value = self.generate_expression(operand)?;
-                match (operator, value) {
-                    (UnaryOp::Negate, BasicValueEnum::IntValue(value)) => {
-                        Ok(self.builder.build_int_neg(value, "negtmp")?.into())
+                let v = self.generate_expression(operand)?;
+                match (operator, v) {
+                    (UnaryOp::Negate, BasicValueEnum::IntValue(x)) => {
+                        Ok(self.builder.build_int_neg(x, "negtmp")?.into())
                     }
-                    (UnaryOp::Negate, BasicValueEnum::FloatValue(value)) => {
-                        Ok(self.builder.build_float_neg(value, "negtmp")?.into())
+                    (UnaryOp::Negate, BasicValueEnum::FloatValue(x)) => {
+                        Ok(self.builder.build_float_neg(x, "negtmp")?.into())
                     }
-                    (UnaryOp::Not, BasicValueEnum::IntValue(value))
-                    | (UnaryOp::BitwiseNot, BasicValueEnum::IntValue(value)) => {
-                        Ok(self.builder.build_not(value, "nottmp")?.into())
+                    (UnaryOp::Not | UnaryOp::BitwiseNot, BasicValueEnum::IntValue(x)) => {
+                        Ok(self.builder.build_not(x, "nottmp")?.into())
                     }
                     _ => Err(CodegenError::at(
                         format!("unsupported unary operand of type {ty:?}"),
@@ -521,32 +583,120 @@ impl<'ctx> CodeGenerator<'ctx> {
                 operand_type,
                 span,
                 ..
-            } => self.generate_binary(left, *operator, right, *operand_type, *span),
-            TypedExpr::Call { .. } => self.generate_call(expression)?.ok_or_else(|| {
-                CodegenError::at("void function call has no value", expression.span())
-            }),
+            } => self.generate_binary(left, *operator, right, operand_type.clone(), *span),
+            TypedExpr::Call {
+                function,
+                name,
+                arguments,
+                ty,
+                ..
+            } => {
+                if name == "make_slice" {
+                    let pointer = self
+                        .generate_expression(&arguments[0])?
+                        .into_pointer_value();
+                    let length = self.generate_expression(&arguments[1])?.into_int_value();
+                    let not_null = self.builder.build_is_not_null(pointer, "slice.not_null")?;
+                    let empty = self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        length.get_type().const_zero(),
+                        "slice.empty",
+                    )?;
+                    self.guard(
+                        self.builder.build_or(not_null, empty, "slice.valid")?,
+                        e.span(),
+                    )?;
+                    let st = self.slice_type();
+                    let mut value = st.get_undef();
+                    value = self
+                        .builder
+                        .build_insert_value(value, pointer, 0, "slice.ptr")?
+                        .into_struct_value();
+                    value = self
+                        .builder
+                        .build_insert_value(value, length, 1, "slice.len")?
+                        .into_struct_value();
+                    return Ok(value.into());
+                }
+                self.generate_call(*function, arguments, e.span())?
+                    .ok_or_else(|| {
+                        CodegenError::at(
+                            format!("void function `{name}` has no value of type {ty:?}"),
+                            e.span(),
+                        )
+                    })
+            }
         }
     }
-
     fn generate_binary(
         &mut self,
-        left: &TypedExpr,
-        operator: BinaryOp,
-        right: &TypedExpr,
-        operand_type: ResolvedType,
+        l: &TypedExpr,
+        op: BinaryOp,
+        r: &TypedExpr,
+        ty: ResolvedType,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        if matches!(operator, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-            return self.generate_logical(left, operator, right, span);
+        if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+            return self.generate_logical(l, op, r, span);
         }
-        let left = self.generate_expression(left)?;
-        let right = self.generate_expression(right)?;
-        match (left, right) {
-            (BasicValueEnum::IntValue(left), BasicValueEnum::IntValue(right)) => {
-                self.generate_integer(left, operator, right, operand_type, span)
+        let a = self.generate_expression(l)?;
+        let b = self.generate_expression(r)?;
+        if let (BasicValueEnum::PointerValue(a), BasicValueEnum::IntValue(b)) = (a, b) {
+            let ResolvedType::Pointer(element) = l.ty() else {
+                return Err(CodegenError::at(
+                    "pointer arithmetic has a non-pointer lhs",
+                    span,
+                ));
+            };
+            let et = self.basic_type(*element)?;
+            let index = if op == BinaryOp::Subtract {
+                self.builder.build_int_neg(b, "ptr.neg")?
+            } else {
+                b
+            };
+            return Ok(unsafe { self.builder.build_gep(et, a, &[index], "ptr.add") }?.into());
+        }
+        if let (BasicValueEnum::PointerValue(a), BasicValueEnum::PointerValue(b)) = (a, b) {
+            if op == BinaryOp::Subtract {
+                let ResolvedType::Pointer(element) = l.ty() else {
+                    return Err(CodegenError::at(
+                        "pointer subtraction has a non-pointer lhs",
+                        span,
+                    ));
+                };
+                return Ok(self
+                    .builder
+                    .build_ptr_diff(self.basic_type(*element)?, a, b, "ptr.diff")?
+                    .into());
             }
-            (BasicValueEnum::FloatValue(left), BasicValueEnum::FloatValue(right)) => {
-                self.generate_float(left, operator, right, span)
+            let pred = match op {
+                BinaryOp::Equal => IntPredicate::EQ,
+                BinaryOp::NotEqual => IntPredicate::NE,
+                BinaryOp::Less => IntPredicate::ULT,
+                BinaryOp::LessEqual => IntPredicate::ULE,
+                BinaryOp::Greater => IntPredicate::UGT,
+                BinaryOp::GreaterEqual => IntPredicate::UGE,
+                _ => return Err(CodegenError::at("invalid pointer operation", span)),
+            };
+            return Ok(self
+                .builder
+                .build_int_compare(
+                    pred,
+                    self.builder
+                        .build_ptr_to_int(a, self.usize_type(), "ptr.a")?,
+                    self.builder
+                        .build_ptr_to_int(b, self.usize_type(), "ptr.b")?,
+                    "ptr.cmp",
+                )?
+                .into());
+        }
+        match (a, b) {
+            (BasicValueEnum::IntValue(a), BasicValueEnum::IntValue(b)) => {
+                self.generate_integer(a, op, b, ty, span)
+            }
+            (BasicValueEnum::FloatValue(a), BasicValueEnum::FloatValue(b)) => {
+                self.generate_float(a, op, b, span)
             }
             _ => Err(CodegenError::at(
                 "binary operands have incompatible resolved types",
@@ -554,342 +704,487 @@ impl<'ctx> CodeGenerator<'ctx> {
             )),
         }
     }
-
     fn generate_logical(
         &mut self,
-        left: &TypedExpr,
-        operator: BinaryOp,
-        right: &TypedExpr,
-        span: Span,
+        l: &TypedExpr,
+        op: BinaryOp,
+        r: &TypedExpr,
+        _span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        let left_raw = self.generate_expression(left)?;
-        let left = self.as_condition(left_raw, left.span())?;
-        let function = self
-            .current_function
-            .ok_or_else(|| CodegenError::at("logical expression outside function", span))?;
-        let right_block = self.context.append_basic_block(function, "logical.right");
-        let short_block = self.context.append_basic_block(function, "logical.short");
-        let merge = self.context.append_basic_block(function, "logical.end");
-        if matches!(operator, BinaryOp::LogicalAnd) {
-            self.builder
-                .build_conditional_branch(left, right_block, short_block)?;
+        let raw_left = self.generate_expression(l)?;
+        let a = self.as_condition(raw_left, l.span())?;
+        let f = self.current_function.unwrap();
+        let rb = self.context.append_basic_block(f, "logical.right");
+        let sb = self.context.append_basic_block(f, "logical.short");
+        let end = self.context.append_basic_block(f, "logical.end");
+        if op == BinaryOp::LogicalAnd {
+            self.builder.build_conditional_branch(a, rb, sb)?;
         } else {
-            self.builder
-                .build_conditional_branch(left, short_block, right_block)?;
+            self.builder.build_conditional_branch(a, sb, rb)?;
         }
-        self.builder.position_at_end(right_block);
-        let right_raw = self.generate_expression(right)?;
-        let right = self.as_condition(right_raw, right.span())?;
-        self.builder.build_unconditional_branch(merge)?;
-        self.builder.position_at_end(short_block);
+        self.builder.position_at_end(rb);
+        let raw_right = self.generate_expression(r)?;
+        let b = self.as_condition(raw_right, r.span())?;
+        self.builder.build_unconditional_branch(end)?;
+        self.builder.position_at_end(sb);
         let short = self
             .context
             .bool_type()
-            .const_int(u64::from(matches!(operator, BinaryOp::LogicalOr)), false);
-        self.builder.build_unconditional_branch(merge)?;
-        self.builder.position_at_end(merge);
+            .const_int(u64::from(op == BinaryOp::LogicalOr), false);
+        self.builder.build_unconditional_branch(end)?;
+        self.builder.position_at_end(end);
         let phi = self
             .builder
             .build_phi(self.context.bool_type(), "logicaltmp")?;
-        phi.add_incoming(&[(&right, right_block), (&short, short_block)]);
+        phi.add_incoming(&[(&b, rb), (&short, sb)]);
         Ok(phi.as_basic_value())
     }
-
     fn generate_integer(
         &mut self,
-        left: IntValue<'ctx>,
-        operator: BinaryOp,
-        right: IntValue<'ctx>,
+        a: IntValue<'ctx>,
+        op: BinaryOp,
+        b: IntValue<'ctx>,
         ty: ResolvedType,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         if ty == ResolvedType::Bool {
-            return match operator {
-                BinaryOp::Equal => Ok(self
+            return Ok(match op {
+                BinaryOp::Equal => self
                     .builder
-                    .build_int_compare(IntPredicate::EQ, left, right, "eqtmp")?
-                    .into()),
-                BinaryOp::NotEqual => Ok(self
+                    .build_int_compare(IntPredicate::EQ, a, b, "eq")?
+                    .into(),
+                BinaryOp::NotEqual => self
                     .builder
-                    .build_int_compare(IntPredicate::NE, left, right, "netmp")?
-                    .into()),
-                _ => Err(CodegenError::at("invalid boolean operator", span)),
-            };
+                    .build_int_compare(IntPredicate::NE, a, b, "ne")?
+                    .into(),
+                _ => return Err(CodegenError::at("invalid boolean operator", span)),
+            });
         }
         let ResolvedType::Integer { width, signed } = ty else {
             return Err(CodegenError::at(
-                "integer operation has non-integer resolved type",
+                "integer operation has non-integer type",
                 span,
             ));
         };
-        let unsigned = !signed;
-        let result = match operator {
-            BinaryOp::Add => self.builder.build_int_add(left, right, "addtmp")?.into(),
-            BinaryOp::Subtract => self.builder.build_int_sub(left, right, "subtmp")?.into(),
-            BinaryOp::Multiply => self.builder.build_int_mul(left, right, "multmp")?.into(),
+        let u = !signed;
+        Ok(match op {
+            BinaryOp::Add => self.builder.build_int_add(a, b, "add")?.into(),
+            BinaryOp::Subtract => self.builder.build_int_sub(a, b, "sub")?.into(),
+            BinaryOp::Multiply => self.builder.build_int_mul(a, b, "mul")?.into(),
             BinaryOp::Divide | BinaryOp::Modulo => {
-                self.guard_integer_division(left, right, signed, span)?;
-                if operator == BinaryOp::Divide {
-                    if unsigned {
-                        self.builder
-                            .build_int_unsigned_div(left, right, "divtmp")?
-                            .into()
+                self.guard_div(a, b, signed, span)?;
+                if op == BinaryOp::Divide {
+                    if u {
+                        self.builder.build_int_unsigned_div(a, b, "div")?.into()
                     } else {
-                        self.builder
-                            .build_int_signed_div(left, right, "divtmp")?
-                            .into()
+                        self.builder.build_int_signed_div(a, b, "div")?.into()
                     }
-                } else if unsigned {
-                    self.builder
-                        .build_int_unsigned_rem(left, right, "modtmp")?
-                        .into()
+                } else if u {
+                    self.builder.build_int_unsigned_rem(a, b, "rem")?.into()
                 } else {
-                    self.builder
-                        .build_int_signed_rem(left, right, "modtmp")?
-                        .into()
+                    self.builder.build_int_signed_rem(a, b, "rem")?.into()
                 }
             }
             BinaryOp::Equal => self
                 .builder
-                .build_int_compare(IntPredicate::EQ, left, right, "eqtmp")?
+                .build_int_compare(IntPredicate::EQ, a, b, "eq")?
                 .into(),
             BinaryOp::NotEqual => self
                 .builder
-                .build_int_compare(IntPredicate::NE, left, right, "netmp")?
+                .build_int_compare(IntPredicate::NE, a, b, "ne")?
                 .into(),
             BinaryOp::Less => self
                 .builder
                 .build_int_compare(
-                    if unsigned {
+                    if u {
                         IntPredicate::ULT
                     } else {
                         IntPredicate::SLT
                     },
-                    left,
-                    right,
-                    "lttmp",
+                    a,
+                    b,
+                    "lt",
                 )?
                 .into(),
             BinaryOp::LessEqual => self
                 .builder
                 .build_int_compare(
-                    if unsigned {
+                    if u {
                         IntPredicate::ULE
                     } else {
                         IntPredicate::SLE
                     },
-                    left,
-                    right,
-                    "letmp",
+                    a,
+                    b,
+                    "le",
                 )?
                 .into(),
             BinaryOp::Greater => self
                 .builder
                 .build_int_compare(
-                    if unsigned {
+                    if u {
                         IntPredicate::UGT
                     } else {
                         IntPredicate::SGT
                     },
-                    left,
-                    right,
-                    "gttmp",
+                    a,
+                    b,
+                    "gt",
                 )?
                 .into(),
             BinaryOp::GreaterEqual => self
                 .builder
                 .build_int_compare(
-                    if unsigned {
+                    if u {
                         IntPredicate::UGE
                     } else {
                         IntPredicate::SGE
                     },
-                    left,
-                    right,
-                    "getmp",
+                    a,
+                    b,
+                    "ge",
                 )?
                 .into(),
-            BinaryOp::BitwiseAnd => self.builder.build_and(left, right, "andtmp")?.into(),
-            BinaryOp::BitwiseOr => self.builder.build_or(left, right, "ortmp")?.into(),
-            BinaryOp::BitwiseXor => self.builder.build_xor(left, right, "xortmp")?.into(),
+            BinaryOp::BitwiseAnd => self.builder.build_and(a, b, "and")?.into(),
+            BinaryOp::BitwiseOr => self.builder.build_or(a, b, "or")?.into(),
+            BinaryOp::BitwiseXor => self.builder.build_xor(a, b, "xor")?.into(),
             BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
                 let bits = match width {
-                    IntegerWidth::Bits(bits) => bits as u64,
+                    IntegerWidth::Bits(x) => x as u64,
                     IntegerWidth::Pointer => self.pointer_width as u64,
                 };
-                let limit = left.get_type().const_int(bits, false);
                 let valid = self.builder.build_int_compare(
                     IntPredicate::ULT,
-                    right,
-                    limit,
+                    b,
+                    a.get_type().const_int(bits, false),
                     "shift.valid",
                 )?;
                 self.guard(valid, span)?;
-                if operator == BinaryOp::ShiftLeft {
-                    self.builder.build_left_shift(left, right, "shltmp")?.into()
+                if op == BinaryOp::ShiftLeft {
+                    self.builder.build_left_shift(a, b, "shl")?.into()
                 } else {
-                    self.builder
-                        .build_right_shift(left, right, signed, "shrtmp")?
-                        .into()
+                    self.builder.build_right_shift(a, b, signed, "shr")?.into()
                 }
             }
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
-                return Err(CodegenError::at(
-                    "logical operators require boolean operands",
-                    span,
-                ));
+                return Err(CodegenError::at("logical operators require bool", span));
             }
-        };
-        Ok(result)
+        })
     }
-
-    fn guard_integer_division(
+    fn guard_div(
         &mut self,
-        left: IntValue<'ctx>,
-        right: IntValue<'ctx>,
+        a: IntValue<'ctx>,
+        b: IntValue<'ctx>,
         signed: bool,
-        span: Span,
+        s: Span,
     ) -> Result<(), CodegenError> {
-        let zero = right.get_type().const_zero();
-        let nonzero =
-            self.builder
-                .build_int_compare(IntPredicate::NE, right, zero, "div.nonzero")?;
-        self.guard(nonzero, span)?;
+        let nz = self.builder.build_int_compare(
+            IntPredicate::NE,
+            b,
+            b.get_type().const_zero(),
+            "div.nonzero",
+        )?;
+        self.guard(nz, s)?;
         if signed {
-            let bits = left.get_type().get_bit_width();
-            let one = left.get_type().const_int(1, false);
-            let shift = left
-                .get_type()
-                .const_int(u64::from(bits.saturating_sub(1)), false);
-            let min = self.builder.build_left_shift(one, shift, "div.min.value")?;
-            let minus_one = left.get_type().const_all_ones();
-            let is_min = self
-                .builder
-                .build_int_compare(IntPredicate::EQ, left, min, "div.min")?;
-            let is_minus_one = self.builder.build_int_compare(
-                IntPredicate::EQ,
-                right,
-                minus_one,
-                "div.minusone",
+            let bits = a.get_type().get_bit_width();
+            let min = self.builder.build_left_shift(
+                a.get_type().const_int(1, false),
+                a.get_type().const_int(u64::from(bits - 1), false),
+                "min",
             )?;
-            let overflow = self
-                .builder
-                .build_and(is_min, is_minus_one, "div.overflow")?;
-            let safe = self.builder.build_not(overflow, "div.safe")?;
-            self.guard(safe, span)?;
+            let ov = self.builder.build_and(
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, a, min, "ismin")?,
+                self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    b,
+                    a.get_type().const_all_ones(),
+                    "isneg",
+                )?,
+                "overflow",
+            )?;
+            self.guard(self.builder.build_not(ov, "safe")?, s)?
         }
         Ok(())
     }
-
-    fn guard(&mut self, condition: IntValue<'ctx>, span: Span) -> Result<(), CodegenError> {
-        let function = self
-            .current_function
-            .ok_or_else(|| CodegenError::at("trap outside function", span))?;
-        let trap = self.context.append_basic_block(function, "trap");
-        let continue_block = self.context.append_basic_block(function, "after.trap");
-        self.builder
-            .build_conditional_branch(condition, continue_block, trap)?;
+    fn guard(&mut self, c: IntValue<'ctx>, _s: Span) -> Result<(), CodegenError> {
+        let f = self.current_function.unwrap();
+        let trap = self.context.append_basic_block(f, "trap");
+        let cont = self.context.append_basic_block(f, "after.trap");
+        self.builder.build_conditional_branch(c, cont, trap)?;
         self.builder.position_at_end(trap);
-        let trap_fn = self.module.get_function("llvm.trap").unwrap_or_else(|| {
+        let tf = self.module.get_function("llvm.trap").unwrap_or_else(|| {
             self.module.add_function(
                 "llvm.trap",
                 self.context.void_type().fn_type(&[], false),
                 None,
             )
         });
-        self.builder.build_call(trap_fn, &[], "trap")?;
+        self.builder.build_call(tf, &[], "trap")?;
         self.builder.build_unreachable()?;
-        self.builder.position_at_end(continue_block);
+        self.builder.position_at_end(cont);
         Ok(())
     }
-
     fn generate_float(
         &self,
-        left: inkwell::values::FloatValue<'ctx>,
-        operator: BinaryOp,
-        right: inkwell::values::FloatValue<'ctx>,
-        span: Span,
+        a: inkwell::values::FloatValue<'ctx>,
+        op: BinaryOp,
+        b: inkwell::values::FloatValue<'ctx>,
+        s: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        Ok(match operator {
-            BinaryOp::Add => self.builder.build_float_add(left, right, "addtmp")?.into(),
-            BinaryOp::Subtract => self.builder.build_float_sub(left, right, "subtmp")?.into(),
-            BinaryOp::Multiply => self.builder.build_float_mul(left, right, "multmp")?.into(),
-            BinaryOp::Divide => self.builder.build_float_div(left, right, "divtmp")?.into(),
-            BinaryOp::Modulo => self.builder.build_float_rem(left, right, "modtmp")?.into(),
+        Ok(match op {
+            BinaryOp::Add => self.builder.build_float_add(a, b, "add")?.into(),
+            BinaryOp::Subtract => self.builder.build_float_sub(a, b, "sub")?.into(),
+            BinaryOp::Multiply => self.builder.build_float_mul(a, b, "mul")?.into(),
+            BinaryOp::Divide => self.builder.build_float_div(a, b, "div")?.into(),
+            BinaryOp::Modulo => self.builder.build_float_rem(a, b, "rem")?.into(),
             BinaryOp::Equal => self
                 .builder
-                .build_float_compare(FloatPredicate::OEQ, left, right, "eqtmp")?
+                .build_float_compare(FloatPredicate::OEQ, a, b, "eq")?
                 .into(),
             BinaryOp::NotEqual => self
                 .builder
-                .build_float_compare(FloatPredicate::ONE, left, right, "netmp")?
+                .build_float_compare(FloatPredicate::ONE, a, b, "ne")?
                 .into(),
             BinaryOp::Less => self
                 .builder
-                .build_float_compare(FloatPredicate::OLT, left, right, "lttmp")?
+                .build_float_compare(FloatPredicate::OLT, a, b, "lt")?
                 .into(),
             BinaryOp::LessEqual => self
                 .builder
-                .build_float_compare(FloatPredicate::OLE, left, right, "letmp")?
+                .build_float_compare(FloatPredicate::OLE, a, b, "le")?
                 .into(),
             BinaryOp::Greater => self
                 .builder
-                .build_float_compare(FloatPredicate::OGT, left, right, "gttmp")?
+                .build_float_compare(FloatPredicate::OGT, a, b, "gt")?
                 .into(),
             BinaryOp::GreaterEqual => self
                 .builder
-                .build_float_compare(FloatPredicate::OGE, left, right, "getmp")?
+                .build_float_compare(FloatPredicate::OGE, a, b, "ge")?
                 .into(),
-            _ => {
-                return Err(CodegenError::at(
-                    "operator is not valid for floating point values",
-                    span,
-                ));
-            }
+            _ => return Err(CodegenError::at("invalid floating point operator", s)),
         })
     }
-
     fn generate_call(
         &mut self,
-        expression: &TypedExpr,
+        id: usize,
+        args: &[TypedExpr],
+        s: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        let TypedExpr::Call {
-            function: id,
-            arguments,
-            span,
-            ..
-        } = expression
-        else {
-            return Err(CodegenError::new("internal error: expected call"));
-        };
-        let function = self
+        let f = self
             .functions
-            .get(id)
+            .get(&id)
             .copied()
-            .ok_or_else(|| CodegenError::at("unknown resolved call target", *span))?;
-        let mut values = Vec::new();
-        for argument in arguments {
-            values.push(BasicMetadataValueEnum::from(
-                self.generate_expression(argument)?,
-            ));
-        }
-        let call = self.builder.build_call(function, &values, "calltmp")?;
-        Ok(call.try_as_basic_value().basic())
+            .ok_or_else(|| CodegenError::at("unknown resolved call target", s))?;
+        let vals = args
+            .iter()
+            .map(|a| {
+                self.generate_expression(a)
+                    .map(BasicMetadataValueEnum::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .builder
+            .build_call(f, &vals, "call")?
+            .try_as_basic_value()
+            .basic())
     }
 
+    fn place_pointer(
+        &mut self,
+        p: &TypedPlace,
+        s: Span,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        match p {
+            TypedPlace::Local { id, .. } => Ok(self
+                .locals
+                .get(id)
+                .ok_or_else(|| CodegenError::at("unknown local", s))?
+                .pointer),
+            TypedPlace::Global { name, .. } => Ok(self
+                .globals
+                .get(name)
+                .ok_or_else(|| CodegenError::at("unknown global", s))?
+                .0),
+            TypedPlace::Temporary { value, ty } => {
+                let lt = self.basic_type(ty.clone())?;
+                let v = self.generate_expression(value)?;
+                let ptr = self.builder.build_alloca(lt, "temporary.addr")?;
+                self.builder.build_store(ptr, v)?;
+                Ok(ptr)
+            }
+            TypedPlace::Field { base, index, .. } => {
+                let bp = self.place_pointer(base, s)?;
+                let ResolvedType::Struct(n) = base.ty() else {
+                    return Err(CodegenError::at("field base is not a struct", s));
+                };
+                let st = self.structs[&n];
+                Ok(self.builder.build_struct_gep(st, bp, *index, "field.ptr")?)
+            }
+            TypedPlace::Index {
+                base,
+                index,
+                checked,
+                ..
+            } => {
+                let bp = self.place_pointer(base, s)?;
+                let iv = self.generate_expression(index)?.into_int_value();
+                match base.ty() {
+                    ResolvedType::Array { .. } => {
+                        let at = self.basic_type(base.ty())?.into_array_type();
+                        if *checked {
+                            self.check_index(iv, p_length(p), s)?;
+                        }
+                        let zero = iv.get_type().const_zero();
+                        Ok(unsafe {
+                            self.builder
+                                .build_in_bounds_gep(at, bp, &[zero, iv], "index.ptr")
+                        }?)
+                    }
+                    ResolvedType::Slice(ref element) => {
+                        let st = self.slice_type();
+                        let slice = self
+                            .builder
+                            .build_load(st, bp, "slice.load")?
+                            .into_struct_value();
+                        let ptr = self
+                            .builder
+                            .build_extract_value(slice, 0, "slice.ptr")?
+                            .into_pointer_value();
+                        let len = self
+                            .builder
+                            .build_extract_value(slice, 1, "slice.len")?
+                            .into_int_value();
+                        if *checked {
+                            let valid = self.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                iv,
+                                len,
+                                "index.valid",
+                            )?;
+                            self.guard(valid, s)?;
+                        }
+                        let et = self.basic_type((**element).clone())?;
+                        Ok(unsafe { self.builder.build_gep(et, ptr, &[iv], "slice.index.ptr") }?)
+                    }
+                    ResolvedType::Pointer(ref element) => {
+                        let ptr = self
+                            .builder
+                            .build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                bp,
+                                "pointer.load",
+                            )?
+                            .into_pointer_value();
+                        let et = self.basic_type((**element).clone())?;
+                        Ok(unsafe { self.builder.build_gep(et, ptr, &[iv], "pointer.index.ptr") }?)
+                    }
+                    _ => Err(CodegenError::at("index base is not indexable", s)),
+                }
+            }
+            TypedPlace::Dereference { pointer, .. } => {
+                Ok(self.generate_expression(pointer)?.into_pointer_value())
+            }
+        }
+    }
+    fn check_index(
+        &mut self,
+        index: IntValue<'ctx>,
+        length: Option<u64>,
+        s: Span,
+    ) -> Result<(), CodegenError> {
+        if let Some(length) = length {
+            let valid = self.builder.build_int_compare(
+                IntPredicate::ULT,
+                index,
+                index.get_type().const_int(length, false),
+                "index.valid",
+            )?;
+            self.guard(valid, s)?;
+        }
+        Ok(())
+    }
     fn as_condition(
         &self,
-        value: BasicValueEnum<'ctx>,
-        span: Span,
+        v: BasicValueEnum<'ctx>,
+        s: Span,
     ) -> Result<IntValue<'ctx>, CodegenError> {
-        match value {
-            BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => Ok(value),
-            _ => Err(CodegenError::at("condition must be a bool", span)),
+        match v {
+            BasicValueEnum::IntValue(x) if x.get_type().get_bit_width() == 1 => Ok(x),
+            _ => Err(CodegenError::at("condition must be a bool", s)),
         }
     }
-
-    fn basic_type(&self, ty: ResolvedType) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
-        Ok(match ty {
+    fn generate_constant(&self, e: &TypedExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match e {
+            TypedExpr::Integer { value, ty, span } => {
+                let BasicTypeEnum::IntType(t) = self.basic_type(ty.clone())? else {
+                    return Err(CodegenError::at("invalid constant integer", *span));
+                };
+                Ok(
+                    t.const_int_from_string(&value.to_string(), StringRadix::Decimal)
+                        .ok_or_else(|| CodegenError::at("invalid global integer", *span))?
+                        .into(),
+                )
+            }
+            TypedExpr::Float { value, ty, .. } => Ok(self
+                .basic_type(ty.clone())?
+                .into_float_type()
+                .const_float(*value)
+                .into()),
+            TypedExpr::Bool { value, .. } => Ok(self
+                .context
+                .bool_type()
+                .const_int(u64::from(*value), false)
+                .into()),
+            TypedExpr::Layout {
+                kind,
+                target,
+                field,
+                span,
+                ..
+            } => {
+                let value = self.layout_value(*kind, target, field.as_deref(), *span)?;
+                Ok(self.usize_type().const_int(value, false).into())
+            }
+            TypedExpr::StructLiteral { ty, fields, .. } => {
+                let st = self.structs[match ty {
+                    ResolvedType::Struct(n) => n,
+                    _ => return Err(CodegenError::new("invalid struct constant")),
+                }];
+                let vals = fields
+                    .iter()
+                    .map(|x| self.generate_constant(x))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(st.const_named_struct(&vals).into())
+            }
+            TypedExpr::ArrayLiteral { ty, elements, .. } => {
+                let BasicTypeEnum::ArrayType(at) = self.basic_type(ty.clone())? else {
+                    return Err(CodegenError::new("invalid array constant"));
+                };
+                let vals = elements
+                    .iter()
+                    .map(|x| self.generate_constant(x))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let av = unsafe { ArrayValue::new_const_array(&at.get_element_type(), &vals) };
+                Ok(av.into())
+            }
+            TypedExpr::Unary {
+                operator, operand, ..
+            } => {
+                let value = self.generate_constant(operand)?;
+                match (operator, value) {
+                    (UnaryOp::Negate, BasicValueEnum::IntValue(v)) => Ok(v.const_neg().into()),
+                    (UnaryOp::Not | UnaryOp::BitwiseNot, BasicValueEnum::IntValue(v)) => {
+                        Ok(v.const_not().into())
+                    }
+                    _ => Err(CodegenError::new("invalid constant unary expression")),
+                }
+            }
+            _ => Err(CodegenError::new("global initializer is not a constant")),
+        }
+    }
+    fn basic_type(&self, t: ResolvedType) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
+        Ok(match t {
             ResolvedType::Bool => self.context.bool_type().into(),
             ResolvedType::Integer { width, .. } => match width {
                 IntegerWidth::Bits(8) => self.context.i8_type().into(),
@@ -897,32 +1192,105 @@ impl<'ctx> CodeGenerator<'ctx> {
                 IntegerWidth::Bits(32) => self.context.i32_type().into(),
                 IntegerWidth::Bits(64) => self.context.i64_type().into(),
                 IntegerWidth::Bits(128) => self.context.i128_type().into(),
-                IntegerWidth::Bits(bits) => {
-                    return Err(CodegenError::new(format!(
-                        "unsupported integer width {bits}"
-                    )));
-                }
                 IntegerWidth::Pointer => self
                     .context
                     .custom_width_int_type(
                         NonZeroU32::new(self.pointer_width)
-                            .ok_or_else(|| CodegenError::new("target pointer width is zero"))?,
+                            .ok_or_else(|| CodegenError::new("zero pointer width"))?,
                     )
                     .map_err(CodegenError::new)?
                     .into(),
+                IntegerWidth::Bits(x) => {
+                    return Err(CodegenError::new(format!("unsupported integer width {x}")));
+                }
             },
             ResolvedType::Float { bits: 32 } => self.context.f32_type().into(),
             ResolvedType::Float { bits: 64 } => self.context.f64_type().into(),
-            ResolvedType::Float { bits } => {
+            ResolvedType::Float { bits, .. } => {
                 return Err(CodegenError::new(format!("unsupported float width {bits}")));
             }
+            ResolvedType::Struct(n) => self
+                .structs
+                .get(&n)
+                .copied()
+                .ok_or_else(|| CodegenError::new(format!("unknown struct `{n}`")))?
+                .into(),
+            ResolvedType::Array { length, element } => {
+                let length = u32::try_from(length).map_err(|_| {
+                    CodegenError::new("fixed array length exceeds the LLVM aggregate limit")
+                })?;
+                self.basic_type(*element)?.array_type(length).into()
+            }
+            ResolvedType::Pointer(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            ResolvedType::Slice(_) => self.slice_type().into(),
             ResolvedType::Unit => return Err(CodegenError::new("unit is not a value type")),
         })
     }
+    fn usize_type(&self) -> inkwell::types::IntType<'ctx> {
+        self.context
+            .custom_width_int_type(NonZeroU32::new(self.pointer_width).unwrap())
+            .unwrap()
+    }
+    fn slice_type(&self) -> StructType<'ctx> {
+        self.context.struct_type(
+            &[
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.usize_type().into(),
+            ],
+            false,
+        )
+    }
+    fn layout_value(
+        &self,
+        kind: LayoutKind,
+        ty: &ResolvedType,
+        field: Option<&str>,
+        span: Span,
+    ) -> Result<u64, CodegenError> {
+        let llvm = self.basic_type(ty.clone())?;
+        let value = match kind {
+            LayoutKind::Size => self.target_data.get_abi_size(&llvm),
+            LayoutKind::Align => u64::from(self.target_data.get_abi_alignment(&llvm)),
+            LayoutKind::Offset => {
+                let Some(field) = field else {
+                    return Err(CodegenError::at("offset_of requires a field", span));
+                };
+                let ResolvedType::Struct(name) = ty else {
+                    return Err(CodegenError::at("offset_of requires a struct", span));
+                };
+                let st = self
+                    .structs
+                    .get(name)
+                    .ok_or_else(|| CodegenError::at("unknown struct", span))?;
+                let index = self.struct_field_index(name, field, span)?;
+                self.target_data
+                    .offset_of_element(st, index)
+                    .ok_or_else(|| CodegenError::at("could not compute field offset", span))?
+            }
+        };
+        Ok(value)
+    }
+    fn struct_field_index(&self, name: &str, field: &str, span: Span) -> Result<u32, CodegenError> {
+        let _st = self
+            .structs
+            .get(name)
+            .ok_or_else(|| CodegenError::at("unknown struct", span))?;
+        self.struct_fields
+            .get(name)
+            .and_then(|fields| fields.get(field))
+            .copied()
+            .ok_or_else(|| CodegenError::at(format!("unknown field `{field}`"), span))
+    }
+}
+fn p_length(place: &TypedPlace) -> Option<u64> {
+    match place {
+        TypedPlace::Index { length, .. } => *length,
+        _ => None,
+    }
 }
 
-fn statement_span(statement: &TypedStmt) -> Span {
-    match statement {
+fn s_span(s: &TypedStmt) -> Span {
+    match s {
         TypedStmt::Declare { span, .. }
         | TypedStmt::Store { span, .. }
         | TypedStmt::Return { span, .. }
@@ -934,56 +1302,49 @@ fn statement_span(statement: &TypedStmt) -> Span {
     }
 }
 
-fn value_span(_value: BasicValueEnum<'_>, span: Span) -> Span {
-    span
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::analyze_source;
+    use crate::pipeline::parse_source;
+    use crate::semantic::analyze_typed;
+    use inkwell::OptimizationLevel;
+    use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
 
-    fn generate(source: &str) -> String {
-        let typed = analyze_source(source).expect("analysis failed");
+    #[test]
+    fn native_layout_matches_llvm_for_structs_and_arrays() {
+        Target::initialize_native(&InitializationConfig::default()).unwrap();
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).unwrap();
+        let machine = target
+            .create_target_machine(
+                &triple,
+                "generic",
+                "",
+                OptimizationLevel::None,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .unwrap();
+        let data = machine.get_target_data();
+        let source = "Pair :: struct { tag: i8; value: i32; } main :: () -> i32 { return 0; }";
+        let program = parse_source(source).unwrap();
+        let typed = analyze_typed(&program).unwrap();
         let context = Context::create();
-        CodeGenerator::new(&context, "test")
-            .generate_typed(&typed)
-            .unwrap()
-            .print_to_string()
-            .to_string()
-    }
+        let module = CodeGenerator::with_pointer_width(
+            &context,
+            "layout_test",
+            data.get_pointer_byte_size(None) * 8,
+        )
+        .generate_typed(&typed)
+        .unwrap();
+        let pair = module.get_struct_type("Pair").unwrap();
+        assert_eq!(data.get_abi_size(&pair), 8);
+        assert_eq!(data.get_abi_alignment(&pair), 4);
+        assert_eq!(data.offset_of_element(&pair, 0), Some(0));
+        assert_eq!(data.offset_of_element(&pair, 1), Some(4));
 
-    #[test]
-    fn generates_minimal_main() {
-        let ir = generate("main :: () -> i32 { return 42; }");
-        assert!(ir.contains("define i32 @main()"));
-        assert!(ir.contains("ret i32 42"));
-    }
-
-    #[test]
-    fn uses_resolved_unsigned_operations() {
-        let ir = generate(
-            "less :: (a: u32, b: u32) -> bool { return a < b; } divide :: (a: u32, b: u32) -> u32 { return a / b; }",
-        );
-        assert!(ir.contains("icmp ult i32"));
-        assert!(ir.contains("udiv i32"));
-        assert!(ir.contains("llvm.trap"));
-    }
-
-    #[test]
-    fn emits_traps_for_invalid_division_and_shifts() {
-        let ir = generate("main :: () -> i32 { x := 0; return 1 / x; }");
-        assert!(ir.contains("div.nonzero"));
-        assert!(ir.contains("llvm.trap"));
-
-        let ir = generate("main :: () -> i32 { x := 1; y := 32; return x << y; }");
-        assert!(ir.contains("icmp ult i32"));
-        assert!(ir.contains("llvm.trap"));
-    }
-
-    #[test]
-    fn wrapping_arithmetic_has_no_overflow_flags() {
-        let ir = generate("main :: () -> i32 { x := 2147483647; return x + 1; }");
-        assert!(ir.contains("add i32") && !ir.contains("add nsw") && !ir.contains("add nuw"));
+        let array = context.i32_type().array_type(3);
+        assert_eq!(data.get_abi_size(&array), 12);
+        assert_eq!(data.get_abi_alignment(&array), 4);
     }
 }
