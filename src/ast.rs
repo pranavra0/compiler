@@ -2,7 +2,18 @@ use crate::lexer::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    pub imports: Vec<ImportDecl>,
     pub declarations: Vec<Decl>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDecl {
+    /// A path such as `os` or `os.compy`, relative to the importing file.
+    pub path: String,
+    /// The namespace used at call sites.  The first implementation defaults
+    /// this to the final path component.
+    pub alias: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +28,7 @@ pub struct StructDecl {
     pub name: String,
     pub fields: Vec<StructField>,
     pub span: Span,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +45,13 @@ pub struct FunctionDecl {
     pub return_type: Type,
     pub body: Block,
     pub span: Span,
+    /// `extern` declarations have no source body but use the same signature
+    /// representation as ordinary functions.
+    pub is_extern: bool,
+    pub abi: Option<String>,
+    /// External symbol name, when it differs from the source/module name.
+    pub link_name: Option<String>,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +61,7 @@ pub struct VariableDecl {
     pub ty: Option<Type>,
     pub value: Expr,
     pub span: Span,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +101,10 @@ pub enum Stmt {
         span: Span,
     },
     Continue {
+        span: Span,
+    },
+    Defer {
+        call: Expr,
         span: Span,
     },
     Return {
@@ -174,6 +198,10 @@ pub enum Expr {
         arguments: Vec<Expr>,
         span: Span,
     },
+    Propagate {
+        expression: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,7 +229,8 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
-            | Expr::Call { span, .. } => *span,
+            | Expr::Call { span, .. }
+            | Expr::Propagate { span, .. } => *span,
         }
     }
 }
@@ -241,7 +270,15 @@ pub enum BinaryOp {
 pub enum Type {
     Unit,
     Named(String),
-    Array { length: u64, element: Box<Type> },
+    Array {
+        length: u64,
+        element: Box<Type>,
+    },
     Pointer(Box<Type>),
     Slice(Box<Type>),
+    /// A tagged result value. Exactly one of success or error is active.
+    Result {
+        success: Box<Type>,
+        error: Box<Type>,
+    },
 }

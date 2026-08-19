@@ -10,14 +10,14 @@ use inkwell::AddressSpace;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::BuilderError;
 use inkwell::context::Context;
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::targets::TargetData;
 use inkwell::types::{BasicType, BasicTypeEnum, StringRadix, StructType};
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
 use inkwell::{FloatPredicate, IntPredicate};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
 
@@ -63,6 +63,12 @@ struct Local<'ctx> {
 struct LoopTargets<'ctx> {
     continue_block: BasicBlock<'ctx>,
     break_block: BasicBlock<'ctx>,
+    defer_depth: usize,
+}
+#[derive(Clone)]
+struct Deferred<'ctx> {
+    function: FunctionValue<'ctx>,
+    arguments: Vec<BasicMetadataValueEnum<'ctx>>,
 }
 #[derive(Clone, Copy)]
 struct Flow(u8);
@@ -89,13 +95,16 @@ pub struct CodeGenerator<'ctx> {
     locals: HashMap<usize, Local<'ctx>>,
     globals: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>, ResolvedType)>,
     functions: HashMap<usize, FunctionValue<'ctx>>,
+    abi_functions: HashSet<usize>,
     structs: HashMap<String, StructType<'ctx>>,
     struct_fields: HashMap<String, HashMap<String, u32>>,
     current_function: Option<FunctionValue<'ctx>>,
+    current_function_id: usize,
     current_return_type: ResolvedType,
     pointer_width: u32,
     target_data: TargetData,
     loop_targets: Vec<LoopTargets<'ctx>>,
+    defer_scopes: Vec<Vec<Deferred<'ctx>>>,
 }
 impl<'ctx> CodeGenerator<'ctx> {
     pub fn new(c: &'ctx Context, n: &str) -> Self {
@@ -115,13 +124,16 @@ impl<'ctx> CodeGenerator<'ctx> {
             locals: HashMap::new(),
             globals: HashMap::new(),
             functions: HashMap::new(),
+            abi_functions: HashSet::new(),
             structs: HashMap::new(),
             struct_fields: HashMap::new(),
             current_function: None,
+            current_function_id: usize::MAX,
             current_return_type: ResolvedType::Unit,
             pointer_width,
             target_data,
             loop_targets: Vec::new(),
+            defer_scopes: Vec::new(),
         }
     }
     pub fn with_pointer_width(c: &'ctx Context, n: &str, w: u32) -> Self {
@@ -135,13 +147,16 @@ impl<'ctx> CodeGenerator<'ctx> {
             locals: HashMap::new(),
             globals: HashMap::new(),
             functions: HashMap::new(),
+            abi_functions: HashSet::new(),
             structs: HashMap::new(),
             struct_fields: HashMap::new(),
             current_function: None,
+            current_function_id: usize::MAX,
             current_return_type: ResolvedType::Unit,
             pointer_width: w,
             target_data,
             loop_targets: Vec::new(),
+            defer_scopes: Vec::new(),
         }
     }
     pub fn generate(self, p: &Program) -> Result<Module<'ctx>, CodegenError> {
@@ -154,7 +169,9 @@ impl<'ctx> CodeGenerator<'ctx> {
         self.declare_globals(p)?;
         self.declare_functions(p)?;
         for f in &p.functions {
-            self.generate_function(f)?
+            if !f.is_extern {
+                self.generate_function(f)?
+            }
         }
         self.module
             .verify()
@@ -206,38 +223,110 @@ impl<'ctx> CodeGenerator<'ctx> {
     }
     fn declare_functions(&mut self, p: &TypedProgram) -> Result<(), CodegenError> {
         for f in &p.functions {
+            if f.abi.is_some() {
+                self.abi_functions.insert(f.id);
+            }
             let params = f
                 .params
                 .iter()
-                .map(|x| self.basic_type(x.ty.clone()).map(Into::into))
+                .map(|x| self.abi_or_basic(f.id, x.ty.clone()).map(Into::into))
                 .collect::<Result<Vec<_>, _>>()?;
             let ft = if f.return_type == ResolvedType::Unit {
                 self.context.void_type().fn_type(&params, false)
             } else {
-                self.basic_type(f.return_type.clone())?
+                self.abi_or_basic(f.id, f.return_type.clone())?
                     .fn_type(&params, false)
             };
-            if self.module.get_function(&f.name).is_some() {
+            let symbol = f.link_name.as_deref().unwrap_or(&f.name);
+            if self.module.get_function(symbol).is_some() {
                 return Err(CodegenError::at(
-                    format!("function `{}` is declared more than once", f.name),
+                    format!("function `{}` is declared more than once", symbol),
                     f.span,
                 ));
             }
-            self.functions
-                .insert(f.id, self.module.add_function(&f.name, ft, None));
+            let function = self.module.add_function(symbol, ft, None);
+            if f.exported {
+                function.set_linkage(Linkage::External);
+            }
+            self.functions.insert(f.id, function);
         }
         Ok(())
     }
+    fn abi_or_basic(
+        &self,
+        function: usize,
+        ty: ResolvedType,
+    ) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
+        let basic = self.basic_type(ty.clone())?;
+        if !self.abi_functions.contains(&function) || !ty.is_aggregate() {
+            return Ok(basic);
+        }
+        let size = self.target_data.get_abi_size(&basic);
+        if size == 0 || size > 16 {
+            return Ok(basic);
+        }
+        let bits = NonZeroU32::new((size * 8) as u32)
+            .ok_or_else(|| CodegenError::new("invalid zero-width C ABI aggregate"))?;
+        Ok(self
+            .context
+            .custom_width_int_type(bits)
+            .map_err(|error| CodegenError::new(error.to_string()))?
+            .into())
+    }
+
+    fn abi_pack(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        function: usize,
+        ty: ResolvedType,
+        _span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let abi = self.abi_or_basic(function, ty.clone())?;
+        if value.get_type() == abi {
+            return Ok(value);
+        }
+        let source = self.basic_type(ty)?;
+        let ptr = self.builder.build_alloca(source, "abi.pack.addr")?;
+        self.builder.build_store(ptr, value)?;
+        Ok(self.builder.build_load(abi, ptr, "abi.pack")?)
+    }
+
+    fn abi_unpack(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        function: usize,
+        ty: ResolvedType,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let abi = self.abi_or_basic(function, ty.clone())?;
+        if value.get_type() == self.basic_type(ty.clone())? {
+            return Ok(value);
+        }
+        if value.get_type() != abi {
+            return Err(CodegenError::at(
+                "foreign ABI value has an unexpected type",
+                span,
+            ));
+        }
+        let source = self.basic_type(ty)?;
+        let ptr = self.builder.build_alloca(abi, "abi.unpack.addr")?;
+        self.builder.build_store(ptr, value)?;
+        Ok(self.builder.build_load(source, ptr, "abi.unpack")?)
+    }
+
     fn generate_function(&mut self, f: &TypedFunction) -> Result<(), CodegenError> {
         let fun = self.functions[&f.id];
         self.current_function = Some(fun);
+        self.current_function_id = f.id;
         self.current_return_type = f.return_type.clone();
         self.locals.clear();
         self.loop_targets.clear();
+        self.defer_scopes.clear();
         let entry = self.context.append_basic_block(fun, "entry");
         self.builder.position_at_end(entry);
         for (i, p) in f.params.iter().enumerate() {
             let v = fun.get_nth_param(i as u32).unwrap();
+            let v = self.abi_unpack(v, f.id, p.ty.clone(), p.span)?;
             let lt = self.basic_type(p.ty.clone())?;
             let ptr = self.builder.build_alloca(lt, &format!("{}.addr", p.name))?;
             self.builder.build_store(ptr, v)?;
@@ -272,6 +361,7 @@ impl<'ctx> CodeGenerator<'ctx> {
     }
     fn generate_block(&mut self, b: &TypedBlock) -> Result<Flow, CodegenError> {
         let saved = self.locals.clone();
+        self.defer_scopes.push(Vec::new());
         let mut flow = Flow::NORMAL;
         for s in &b.statements {
             if flow.contains(Flow::NORMAL) {
@@ -280,6 +370,10 @@ impl<'ctx> CodeGenerator<'ctx> {
                     .union(self.generate_statement(s)?);
             }
         }
+        if flow.contains(Flow::NORMAL) {
+            self.emit_defers_from(self.defer_scopes.len() - 1)?;
+        }
+        self.defer_scopes.pop();
         self.locals = saved;
         Ok(flow)
     }
@@ -327,6 +421,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                 Ok(Flow::NORMAL)
             }
             TypedStmt::Return { value, span } => {
+                self.emit_defers_from(0)?;
                 match (self.current_return_type.clone(), value) {
                     (ResolvedType::Unit, None) => {
                         self.builder.build_return(None)?;
@@ -345,13 +440,58 @@ impl<'ctx> CodeGenerator<'ctx> {
                     }
                     (_, Some(x)) => {
                         let v = self.generate_expression(x)?;
+                        let v = self.abi_pack(
+                            v,
+                            self.current_function_id,
+                            self.current_return_type.clone(),
+                            *span,
+                        )?;
                         self.builder.build_return(Some(&v))?;
                     }
                 }
                 Ok(Flow::RETURN)
             }
             TypedStmt::Expr { expression, .. } => {
-                self.generate_expression(expression)?;
+                if let TypedExpr::Call {
+                    function,
+                    name,
+                    arguments,
+                    ty,
+                    ..
+                } = expression
+                {
+                    if name == "make_slice" {
+                        self.generate_expression(expression)?;
+                    } else {
+                        self.generate_call(*function, arguments, ty.clone(), expression.span())?;
+                    }
+                } else {
+                    self.generate_expression(expression)?;
+                }
+                Ok(Flow::NORMAL)
+            }
+            TypedStmt::Defer {
+                function,
+                arguments,
+                ..
+            } => {
+                let mut values = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    let value = self.generate_expression(argument)?;
+                    let value = self.abi_pack(value, *function, argument.ty(), argument.span())?;
+                    values.push(BasicMetadataValueEnum::from(value));
+                }
+                self.defer_scopes
+                    .last_mut()
+                    .ok_or_else(|| CodegenError::new("defer outside a scope"))?
+                    .push(Deferred {
+                        function: self
+                            .functions
+                            .get(function)
+                            .copied()
+                            .ok_or_else(|| CodegenError::new("unknown deferred function"))?,
+                        arguments: values,
+                    });
                 Ok(Flow::NORMAL)
             }
             TypedStmt::Break { span } => {
@@ -360,6 +500,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     .last()
                     .copied()
                     .ok_or_else(|| CodegenError::at("break is outside a loop", *span))?;
+                self.emit_defers_from(t.defer_depth)?;
                 self.builder.build_unconditional_branch(t.break_block)?;
                 Ok(Flow::BREAK)
             }
@@ -369,6 +510,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     .last()
                     .copied()
                     .ok_or_else(|| CodegenError::at("continue is outside a loop", *span))?;
+                self.emit_defers_from(t.defer_depth)?;
                 self.builder.build_unconditional_branch(t.continue_block)?;
                 Ok(Flow::CONTINUE)
             }
@@ -382,6 +524,18 @@ impl<'ctx> CodeGenerator<'ctx> {
                 condition, body, ..
             } => self.generate_while(condition, body),
         }
+    }
+    fn emit_defers_from(&mut self, depth: usize) -> Result<(), CodegenError> {
+        let actions: Vec<Deferred<'ctx>> = self.defer_scopes[depth..]
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.iter().rev().cloned())
+            .collect();
+        for action in actions {
+            self.builder
+                .build_call(action.function, &action.arguments, "defer.call")?;
+        }
+        Ok(())
     }
     fn generate_if(
         &mut self,
@@ -431,9 +585,11 @@ impl<'ctx> CodeGenerator<'ctx> {
         } else {
             self.builder.build_conditional_branch(cv, bb, eb)?;
         }
+        let defer_depth = self.defer_scopes.len();
         self.loop_targets.push(LoopTargets {
             continue_block: cb,
             break_block: eb,
+            defer_depth,
         });
         self.builder.position_at_end(bb);
         let bf = self.generate_block(b)?;
@@ -492,6 +648,118 @@ impl<'ctx> CodeGenerator<'ctx> {
                 Ok(self
                     .builder
                     .build_load(self.basic_type(ty.clone())?, p, "deref.load")?)
+            }
+            TypedExpr::ResultOk { value, ty, span } => {
+                let ResolvedType::Result { success, error } = ty else {
+                    return Err(CodegenError::at("invalid result success type", *span));
+                };
+                let rt = self.result_type(success, error)?;
+                let v = if **success == ResolvedType::Unit {
+                    self.context.i8_type().const_zero().into()
+                } else {
+                    self.generate_expression(value)?
+                };
+                let mut out = rt.get_undef();
+                out = self
+                    .builder
+                    .build_insert_value(out, self.context.bool_type().const_zero(), 0, "result.ok")?
+                    .into_struct_value();
+                out = self
+                    .builder
+                    .build_insert_value(out, v, 1, "result.value")?
+                    .into_struct_value();
+                Ok(out.into())
+            }
+            TypedExpr::ResultErr { value, ty, span } => {
+                let ResolvedType::Result { success, error } = ty else {
+                    return Err(CodegenError::at("invalid result error type", *span));
+                };
+                let rt = self.result_type(success, error)?;
+                let v = self.generate_expression(value)?;
+                let mut out = rt.get_undef();
+                out = self
+                    .builder
+                    .build_insert_value(
+                        out,
+                        self.context.bool_type().const_all_ones(),
+                        0,
+                        "result.err",
+                    )?
+                    .into_struct_value();
+                out = self
+                    .builder
+                    .build_insert_value(out, v, 2, "result.error")?
+                    .into_struct_value();
+                Ok(out.into())
+            }
+            TypedExpr::IsErr { value, .. } => {
+                let v = self.generate_expression(value)?.into_struct_value();
+                Ok(self
+                    .builder
+                    .build_extract_value(v, 0, "result.is_err")?
+                    .into())
+            }
+            TypedExpr::Unwrap { value, ty, span } => {
+                let v = self.generate_expression(value)?.into_struct_value();
+                let tag = self
+                    .builder
+                    .build_extract_value(v, 0, "result.tag")?
+                    .into_int_value();
+                self.guard(self.builder.build_not(tag, "result.ok")?, *span)?;
+                if *ty == ResolvedType::Unit {
+                    Ok(self.context.i8_type().const_zero().into())
+                } else {
+                    Ok(self.builder.build_extract_value(v, 1, "result.unwrap")?)
+                }
+            }
+            TypedExpr::Propagate {
+                value,
+                ty,
+                span: _span,
+            } => {
+                let v = self.generate_expression(value)?.into_struct_value();
+                let tag = self
+                    .builder
+                    .build_extract_value(v, 0, "result.tag")?
+                    .into_int_value();
+                let f = self.current_function.unwrap();
+                let eb = self.context.append_basic_block(f, "propagate.error");
+                let ok = self.context.append_basic_block(f, "propagate.ok");
+                self.builder.build_conditional_branch(tag, eb, ok)?;
+                self.builder.position_at_end(eb);
+                self.emit_defers_from(0)?;
+                let rv = self
+                    .builder
+                    .build_extract_value(v, 2, "propagate.error.value")?;
+                let ResolvedType::Result { success, error } = self.current_return_type.clone()
+                else {
+                    return Err(CodegenError::at(
+                        "propagation target is not a result",
+                        value.span(),
+                    ));
+                };
+                let rt = self.result_type(&success, &error)?;
+                let mut returned = rt.get_undef();
+                returned = self
+                    .builder
+                    .build_insert_value(
+                        returned,
+                        self.context.bool_type().const_all_ones(),
+                        0,
+                        "propagate.return.err",
+                    )?
+                    .into_struct_value();
+                returned = self
+                    .builder
+                    .build_insert_value(returned, rv, 2, "propagate.return.value")?
+                    .into_struct_value();
+                self.builder.build_return(Some(&returned))?;
+                self.builder.position_at_end(ok);
+                if *ty == ResolvedType::Unit {
+                    Ok(self.context.i8_type().const_zero().into())
+                } else {
+                    Ok(self.builder.build_extract_value(v, 1, "propagate.value")?)
+                }
             }
             TypedExpr::Layout {
                 kind,
@@ -619,7 +887,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                         .into_struct_value();
                     return Ok(value.into());
                 }
-                self.generate_call(*function, arguments, e.span())?
+                self.generate_call(*function, arguments, ty.clone(), e.span())?
                     .ok_or_else(|| {
                         CodegenError::at(
                             format!("void function `{name}` has no value of type {ty:?}"),
@@ -969,6 +1237,7 @@ impl<'ctx> CodeGenerator<'ctx> {
         &mut self,
         id: usize,
         args: &[TypedExpr],
+        return_type: ResolvedType,
         s: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let f = self
@@ -976,18 +1245,20 @@ impl<'ctx> CodeGenerator<'ctx> {
             .get(&id)
             .copied()
             .ok_or_else(|| CodegenError::at("unknown resolved call target", s))?;
-        let vals = args
-            .iter()
-            .map(|a| {
-                self.generate_expression(a)
-                    .map(BasicMetadataValueEnum::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(self
+        let mut vals = Vec::with_capacity(args.len());
+        for argument in args {
+            let value = self.generate_expression(argument)?;
+            let value = self.abi_pack(value, id, argument.ty(), argument.span())?;
+            vals.push(BasicMetadataValueEnum::from(value));
+        }
+        let result = self
             .builder
             .build_call(f, &vals, "call")?
             .try_as_basic_value()
-            .basic())
+            .basic();
+        result
+            .map(|value| self.abi_unpack(value, id, return_type.clone(), s))
+            .transpose()
     }
 
     fn place_pointer(
@@ -1223,6 +1494,7 @@ impl<'ctx> CodeGenerator<'ctx> {
             }
             ResolvedType::Pointer(_) => self.context.ptr_type(AddressSpace::default()).into(),
             ResolvedType::Slice(_) => self.slice_type().into(),
+            ResolvedType::Result { success, error } => self.result_type(&success, &error)?.into(),
             ResolvedType::Unit => return Err(CodegenError::new("unit is not a value type")),
         })
     }
@@ -1230,6 +1502,22 @@ impl<'ctx> CodeGenerator<'ctx> {
         self.context
             .custom_width_int_type(NonZeroU32::new(self.pointer_width).unwrap())
             .unwrap()
+    }
+    fn result_type(
+        &self,
+        success: &ResolvedType,
+        error: &ResolvedType,
+    ) -> Result<StructType<'ctx>, CodegenError> {
+        let success_ty = if *success == ResolvedType::Unit {
+            self.context.i8_type().into()
+        } else {
+            self.basic_type(success.clone())?
+        };
+        let error_ty = self.basic_type(error.clone())?;
+        Ok(self.context.struct_type(
+            &[self.context.bool_type().into(), success_ty, error_ty],
+            false,
+        ))
     }
     fn slice_type(&self) -> StructType<'ctx> {
         self.context.struct_type(
@@ -1299,6 +1587,7 @@ fn s_span(s: &TypedStmt) -> Span {
         | TypedStmt::While { span, .. }
         | TypedStmt::Break { span }
         | TypedStmt::Continue { span } => *span,
+        TypedStmt::Defer { span, .. } => *span,
     }
 }
 

@@ -307,6 +307,124 @@ fn unchecked_index_has_no_generated_bounds_trap() {
 }
 
 #[test]
+fn result_values_propagate_and_are_inspectable() {
+    let (source_path, output_root) = paths("result_values");
+    fs::write(
+        &source_path,
+        "read :: (x: i32) -> i32 | i32 { if x == 0 { return return_err(7); } return return_ok(x + 1); } get :: (x: i32) -> i32 | i32 { value := read(x)?; return return_ok(value + 1); } main :: () -> i32 { result := get(0); if is_err(result) { return 7; } return unwrap(result); }",
+    )
+    .unwrap();
+    let build = compiler()
+        .args(["build"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&output_root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "result build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(Command::new(&output_root).status().unwrap().code(), Some(7));
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(&output_root);
+    let _ = fs::remove_file(output_root.with_extension("o"));
+}
+
+#[test]
+fn propagation_requires_a_compatible_error_return_type() {
+    let (source_path, output_root) = paths("result_invalid_propagation");
+    fs::write(
+        &source_path,
+        "source :: () -> i32 | i64 { return return_ok(1); } wrapper :: () -> i32 | i32 { value := source()?; return return_ok(value); } main :: () -> i32 { return 0; }",
+    )
+    .unwrap();
+    let result = compiler().arg("check").arg(&source_path).output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("propagated error type is incompatible")
+    );
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(output_root);
+}
+
+#[test]
+fn defer_is_lifo_captures_values_and_runs_on_loop_exits_and_propagation() {
+    let cases = [
+        (
+            "defer_lifo_capture",
+            21,
+            "counter : i32 = 0; one :: (x: i32) -> void { counter = counter * 10 + x; } two :: (x: i32) -> void { counter = counter * 10 + x + 1; } f :: () -> void { x := 1; defer one(x); defer two(x); x = 9; } main :: () -> i32 { f(); return counter; }",
+        ),
+        (
+            "defer_early_return",
+            1,
+            "counter : i32 = 0; inc :: () -> void { counter = counter + 1; } f :: () -> void { defer inc(); return; } main :: () -> i32 { f(); return counter; }",
+        ),
+        (
+            "defer_loop_exit",
+            3,
+            "counter : i32 = 0; inc :: () -> void { counter = counter + 1; } main :: () -> i32 { i := 0; while i < 3 { defer inc(); i = i + 1; if i == 1 { continue; } if i == 3 { break; } } return counter; }",
+        ),
+        (
+            "defer_propagation",
+            1,
+            "counter : i32 = 0; inc :: () -> void { counter = counter + 1; } fail :: () -> i32 | i32 { return return_err(9); } wrapped :: () -> i32 | i32 { defer inc(); value := fail()?; return return_ok(value); } main :: () -> i32 { result := wrapped(); if is_err(result) { return counter; } return 0; }",
+        ),
+    ];
+    for (label, expected, source) in cases {
+        let (source_path, output_root) = paths(label);
+        fs::write(&source_path, source).unwrap();
+        let build = compiler()
+            .args(["build"])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&output_root)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{label} build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert_eq!(
+            Command::new(&output_root).status().unwrap().code(),
+            Some(expected)
+        );
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(&output_root);
+        let _ = fs::remove_file(output_root.with_extension("o"));
+    }
+}
+
+#[test]
+fn explicit_allocator_arguments_are_ordinary_library_calls() {
+    let (source_path, output_root) = paths("allocator_boundary");
+    fs::write(
+        &source_path,
+        "Allocator :: struct { observed: i32; } alloc :: (allocator: *Allocator, size: usize, alignment: usize) -> []u8 | i32 { if alignment == 0 { return return_err(9); } (*allocator).observed = 1; return return_ok(make_slice(null, size)); } dealloc :: (allocator: *Allocator, memory: []u8, alignment: usize) -> void { (*allocator).observed = 8; } main :: () -> i32 { allocator := Allocator{ observed = 0 }; memory := alloc(&allocator, 0, 8); failed := alloc(&allocator, 0, 0); if !is_err(failed) { return 99; } if is_err(memory) { return 98; } dealloc(&allocator, unwrap(memory), 8); return allocator.observed; }", 
+    )
+    .unwrap();
+    let build = compiler()
+        .args(["build"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&output_root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "allocator boundary failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(Command::new(&output_root).status().unwrap().code(), Some(8));
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(&output_root);
+    let _ = fs::remove_file(output_root.with_extension("o"));
+}
+
+#[test]
 fn rejects_invalid_loop_programs_before_codegen() {
     let cases = [
         "main :: () -> i32 { break; return 0; }",

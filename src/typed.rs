@@ -32,6 +32,11 @@ pub enum ResolvedType {
     },
     Pointer(Box<ResolvedType>),
     Slice(Box<ResolvedType>),
+    /// `{ i1, success, error }` in the LLVM backend. The tag is true for error.
+    Result {
+        success: Box<ResolvedType>,
+        error: Box<ResolvedType>,
+    },
 }
 impl ResolvedType {
     pub fn is_integer(&self) -> bool {
@@ -41,7 +46,10 @@ impl ResolvedType {
         matches!(self, Self::Integer { signed: true, .. })
     }
     pub fn is_aggregate(&self) -> bool {
-        matches!(self, Self::Struct(_) | Self::Array { .. } | Self::Slice(_))
+        matches!(
+            self,
+            Self::Struct(_) | Self::Array { .. } | Self::Slice(_) | Self::Result { .. }
+        )
     }
 }
 
@@ -89,6 +97,10 @@ pub struct TypedFunction {
     pub return_type: ResolvedType,
     pub body: TypedBlock,
     pub span: Span,
+    pub is_extern: bool,
+    pub abi: Option<String>,
+    pub link_name: Option<String>,
+    pub exported: bool,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedParameter {
@@ -166,6 +178,12 @@ pub enum TypedStmt {
         span: Span,
     },
     Continue {
+        span: Span,
+    },
+    Defer {
+        function: FunctionId,
+        name: String,
+        arguments: Vec<TypedExpr>,
         span: Span,
     },
     Return {
@@ -283,6 +301,31 @@ pub enum TypedExpr {
         field: Option<String>,
         span: Span,
     },
+    ResultOk {
+        value: Box<TypedExpr>,
+        ty: ResolvedType,
+        span: Span,
+    },
+    ResultErr {
+        value: Box<TypedExpr>,
+        ty: ResolvedType,
+        span: Span,
+    },
+    IsErr {
+        value: Box<TypedExpr>,
+        ty: ResolvedType,
+        span: Span,
+    },
+    Unwrap {
+        value: Box<TypedExpr>,
+        ty: ResolvedType,
+        span: Span,
+    },
+    Propagate {
+        value: Box<TypedExpr>,
+        ty: ResolvedType,
+        span: Span,
+    },
 }
 impl TypedExpr {
     pub fn ty(&self) -> ResolvedType {
@@ -302,7 +345,12 @@ impl TypedExpr {
             | Self::Null { ty, .. }
             | Self::AddressOf { ty, .. }
             | Self::Dereference { ty, .. }
-            | Self::Layout { ty, .. } => ty.clone(),
+            | Self::Layout { ty, .. }
+            | Self::ResultOk { ty, .. }
+            | Self::ResultErr { ty, .. }
+            | Self::IsErr { ty, .. }
+            | Self::Unwrap { ty, .. }
+            | Self::Propagate { ty, .. } => ty.clone(),
         }
     }
     pub fn span(&self) -> Span {
@@ -322,7 +370,12 @@ impl TypedExpr {
             | Self::Null { span, .. }
             | Self::AddressOf { span, .. }
             | Self::Dereference { span, .. }
-            | Self::Layout { span, .. } => *span,
+            | Self::Layout { span, .. }
+            | Self::ResultOk { span, .. }
+            | Self::ResultErr { span, .. }
+            | Self::IsErr { span, .. }
+            | Self::Unwrap { span, .. }
+            | Self::Propagate { span, .. } => *span,
         }
     }
 }

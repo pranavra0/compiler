@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 use compiler::codegen::CodeGenerator;
+use compiler::modules;
 use compiler::pipeline::{self, FrontendError};
 use compiler::semantic;
 use compiler::source::SourceMap;
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
 };
 
 fn main() {
@@ -23,7 +24,7 @@ fn main() {
     let filename = &arguments[2];
 
     let result = match command.as_str() {
-        "lex" | "parse" | "check" | "ir" => {
+        "lex" | "parse" => {
             if arguments.len() != 3 {
                 print_usage();
                 process::exit(1);
@@ -32,12 +33,17 @@ fn main() {
                 Ok(source) => source,
                 Err(error) => exit_with_error(error),
             };
-            match command.as_str() {
-                "lex" => lex_command(filename, &source),
-                "parse" => parse_command(filename, &source),
-                "check" => check_command(filename, &source),
-                "ir" => ir_command(filename, &source),
-                _ => unreachable!(),
+            if command == "lex" {
+                lex_command(filename, &source)
+            } else {
+                parse_command(filename, &source)
+            }
+        }
+        "check" | "ir" => {
+            if command == "check" {
+                check_command(filename, &arguments[3..])
+            } else {
+                ir_command(filename, &arguments[3..])
             }
         }
         "build" | "compile" => build_command(filename, &arguments[3..]),
@@ -96,39 +102,95 @@ fn parse_command(filename: &str, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_command(filename: &str, source: &str) -> Result<(), String> {
-    pipeline::analyze_source(source).map_err(|error| frontend_error(filename, source, error))?;
+fn project(filename: &str, arguments: &[String]) -> Result<modules::Project, String> {
+    let roots = module_roots(arguments)?;
+    modules::resolve(filename, &roots).map_err(|error| {
+        let source = read_source(filename).unwrap_or_default();
+        format!(
+            "error: module error: {} at {filename}:{}:{}",
+            error,
+            SourceMap::new(&source).position(error.span.start).line,
+            SourceMap::new(&source).position(error.span.start).column
+        )
+    })
+}
+
+fn check_command(filename: &str, arguments: &[String]) -> Result<(), String> {
+    let options = BuildOptions::parse(arguments)?;
+    let project = project(filename, arguments)?;
+    pipeline::analyze_program_with_pointer_width(&project.program, pointer_width_for(&options)?)
+        .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     println!("semantic analysis succeeded");
     Ok(())
 }
 
-fn ir_command(filename: &str, source: &str) -> Result<(), String> {
-    let typed = pipeline::analyze_source(source)
-        .map_err(|error| frontend_error(filename, source, error))?;
+fn ir_command(filename: &str, arguments: &[String]) -> Result<(), String> {
+    let options = BuildOptions::parse(arguments)?;
+    let project = project(filename, arguments)?;
+    let typed = pipeline::analyze_program_with_pointer_width(
+        &project.program,
+        pointer_width_for(&options)?,
+    )
+    .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let context = Context::create();
-    let module = CodeGenerator::new(&context, "compy")
-        .generate_typed(&typed)
-        .map_err(|error| format!("error: codegen error: {error}"))?;
+    let module = if options.target.is_some() {
+        Target::initialize_all(&InitializationConfig::default());
+        let triple = options.target.as_deref().map(TargetTriple::create).unwrap();
+        let target =
+            Target::from_triple(&triple).map_err(|e| format!("could not find target: {e}"))?;
+        let machine = target
+            .create_target_machine(
+                &triple,
+                "generic",
+                "",
+                optimization_level(options.opt_level),
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| "could not create target machine".to_string())?;
+        let data = machine.get_target_data();
+        let module = CodeGenerator::with_target_data(&context, "compy", &data)
+            .generate_typed(&typed)
+            .map_err(|error| format!("error: codegen error: {error}"))?;
+        module.set_triple(&triple);
+        module
+    } else {
+        CodeGenerator::new(&context, "compy")
+            .generate_typed(&typed)
+            .map_err(|error| format!("error: codegen error: {error}"))?
+    };
     print!("{}", module.print_to_string().to_string());
     Ok(())
 }
 
 fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
-    let output = output_path(filename, arguments)?;
-    let object = output.with_extension("o");
-    let source = read_source(filename)?;
-    let program = pipeline::parse_source(&source)
-        .map_err(|error| frontend_error(filename, &source, error))?;
-    semantic::validate_entry_point(&program).map_err(|error| {
-        let frontend = FrontendError::Semantic(error);
-        frontend_error(filename, &source, frontend)
-    })?;
-    let typed = pipeline::analyze_program(&program)
-        .map_err(|error| frontend_error(filename, &source, error))?;
-
-    Target::initialize_native(&InitializationConfig::default())
-        .map_err(|error| format!("could not initialize the native LLVM target: {error}"))?;
-    let target_triple = TargetMachine::get_default_triple();
+    let options = BuildOptions::parse(arguments)?;
+    let output = if options.emit_object {
+        options
+            .output
+            .clone()
+            .unwrap_or_else(|| Path::new(filename).with_extension("o"))
+    } else {
+        options
+            .output
+            .clone()
+            .unwrap_or(output_path(filename, &[])?)
+    };
+    let object = if options.emit_object {
+        output.clone()
+    } else {
+        output.with_extension("o")
+    };
+    let project = project(filename, arguments)?;
+    if let Some(depfile) = &options.depfile {
+        write_dependency_file(depfile, &output, &project.dependencies)?;
+    }
+    Target::initialize_all(&InitializationConfig::default());
+    let target_triple = options
+        .target
+        .as_deref()
+        .map(TargetTriple::create)
+        .unwrap_or_else(TargetMachine::get_default_triple);
     let target = Target::from_triple(&target_triple)
         .map_err(|error| format!("could not find the native LLVM target: {error}"))?;
     let target_machine = target
@@ -136,12 +198,23 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
             &target_triple,
             "generic",
             "",
-            OptimizationLevel::Default,
+            optimization_level(options.opt_level),
             RelocMode::PIC,
             CodeModel::Default,
         )
         .ok_or_else(|| "could not create the native LLVM target machine".to_string())?;
     let target_data = target_machine.get_target_data();
+    if !options.emit_object {
+        semantic::validate_entry_point(&project.program).map_err(|error| {
+            let frontend = FrontendError::Semantic(error);
+            frontend_error(filename, &project.root_source, frontend)
+        })?;
+    }
+    let typed = pipeline::analyze_program_with_pointer_width(
+        &project.program,
+        target_data.get_pointer_byte_size(None) * 8,
+    )
+    .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let context = Context::create();
     let module = CodeGenerator::with_target_data(&context, module_name(&output), &target_data)
         .generate_typed(&typed)
@@ -152,30 +225,16 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     target_machine
         .write_to_file(&module, FileType::Object, &object)
         .map_err(|error| format!("could not emit object file `{}`: {error}", object.display()))?;
-    link_native(&object, &output)?;
     println!("object: {}", object.display());
+    if options.emit_object {
+        return Ok(());
+    }
+    link_native(&object, &output, &options)?;
     println!("executable: {}", output.display());
     Ok(())
 }
 
-fn output_path(filename: &str, arguments: &[String]) -> Result<PathBuf, String> {
-    let mut output = None;
-    let mut position = 0;
-    while position < arguments.len() {
-        match arguments[position].as_str() {
-            "-o" | "--output" => {
-                position += 1;
-                output = Some(PathBuf::from(arguments.get(position).ok_or_else(|| {
-                    "missing output path after `-o`/`--output`".to_string()
-                })?));
-            }
-            argument => return Err(format!("unknown build argument `{argument}`")),
-        }
-        position += 1;
-    }
-    if let Some(output) = output {
-        return Ok(output);
-    }
+fn output_path(filename: &str, _arguments: &[String]) -> Result<PathBuf, String> {
     let stem = Path::new(filename)
         .file_stem()
         .ok_or_else(|| format!("could not determine an output name from `{filename}`"))?;
@@ -198,13 +257,147 @@ fn create_parent_directory(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn link_native(object: &Path, output: &Path) -> Result<(), String> {
+#[derive(Debug, Default)]
+struct BuildOptions {
+    output: Option<PathBuf>,
+    library_paths: Vec<PathBuf>,
+    libraries: Vec<String>,
+    objects: Vec<PathBuf>,
+    target: Option<String>,
+    linker: Option<PathBuf>,
+    link_args: Vec<String>,
+    depfile: Option<PathBuf>,
+    opt_level: u8,
+    emit_object: bool,
+}
+impl BuildOptions {
+    fn parse(arguments: &[String]) -> Result<Self, String> {
+        let mut out = Self::default();
+        let mut i = 0;
+        while i < arguments.len() {
+            let flag = arguments[i].as_str();
+            let value = |i: &mut usize, name: &str| -> Result<String, String> {
+                *i += 1;
+                arguments
+                    .get(*i)
+                    .cloned()
+                    .ok_or_else(|| format!("missing value after `{name}`"))
+            };
+            match flag {
+                "-o" | "--output" => out.output = Some(PathBuf::from(value(&mut i, flag)?)),
+                "-I" | "--module-root" => {
+                    let _ = value(&mut i, flag)?;
+                }
+                "-L" => out.library_paths.push(PathBuf::from(value(&mut i, flag)?)),
+                "-l" | "--library" => out.libraries.push(value(&mut i, flag)?),
+                "--object" => out.objects.push(PathBuf::from(value(&mut i, flag)?)),
+                "--target" => out.target = Some(value(&mut i, flag)?),
+                "--linker" => out.linker = Some(PathBuf::from(value(&mut i, flag)?)),
+                "--link-arg" => out.link_args.push(value(&mut i, flag)?),
+                "--depfile" => out.depfile = Some(PathBuf::from(value(&mut i, flag)?)),
+                "-O" | "--opt-level" => {
+                    out.opt_level = value(&mut i, flag)?
+                        .parse()
+                        .map_err(|_| "optimization level must be 0, 1, 2, or 3".to_string())?;
+                    if out.opt_level > 3 {
+                        return Err("optimization level must be 0, 1, 2, or 3".into());
+                    }
+                }
+                "--emit-object" | "--object-only" => out.emit_object = true,
+                other => return Err(format!("unknown build argument `{other}`")),
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+}
+fn optimization_level(level: u8) -> OptimizationLevel {
+    match level {
+        0 => OptimizationLevel::None,
+        1 => OptimizationLevel::Less,
+        2 => OptimizationLevel::Default,
+        _ => OptimizationLevel::Aggressive,
+    }
+}
+fn pointer_width_for(options: &BuildOptions) -> Result<u32, String> {
+    let Some(target_name) = options.target.as_deref() else {
+        return Ok(usize::BITS);
+    };
+    Target::initialize_all(&InitializationConfig::default());
+    let triple = TargetTriple::create(target_name);
+    let target = Target::from_triple(&triple).map_err(|e| format!("could not find target: {e}"))?;
+    let machine = target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            optimization_level(options.opt_level),
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| "could not create target machine".to_string())?;
+    Ok(machine.get_target_data().get_pointer_byte_size(None) * 8)
+}
+fn module_roots(arguments: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    let mut i = 0;
+    while i < arguments.len() {
+        if matches!(arguments[i].as_str(), "-I" | "--module-root") {
+            i += 1;
+            roots.push(PathBuf::from(
+                arguments
+                    .get(i)
+                    .ok_or_else(|| "missing module root".to_string())?,
+            ));
+        }
+        i += 1;
+    }
+    Ok(roots)
+}
+
+fn write_dependency_file(
+    path: &Path,
+    output: &Path,
+    dependencies: &[PathBuf],
+) -> Result<(), String> {
+    create_parent_directory(path)?;
+    let mut text = format!("{}:", output.display());
+    for dependency in dependencies {
+        text.push(' ');
+        text.push_str(&dependency.display().to_string());
+    }
+    text.push('\n');
+    fs::write(path, text).map_err(|error| {
+        format!(
+            "could not write dependency file `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+fn link_native(object: &Path, output: &Path, options: &BuildOptions) -> Result<(), String> {
     create_parent_directory(output)?;
-    let compiler = env::var_os("CC")
-        .map(PathBuf::from)
+    let compiler = options
+        .linker
+        .clone()
+        .or_else(|| env::var_os("CC").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("clang"));
-    let status = Command::new(&compiler)
-        .arg(object)
+    let mut command = Command::new(&compiler);
+    if let Some(target) = &options.target {
+        command.arg(format!("--target={target}"));
+    }
+    command.arg(object);
+    for item in &options.objects {
+        command.arg(item);
+    }
+    for path in &options.library_paths {
+        command.arg("-L").arg(path);
+    }
+    for library in &options.libraries {
+        command.arg("-l").arg(library);
+    }
+    command.args(&options.link_args);
+    let status = command
         .arg("-o")
         .arg(output)
         .status()
@@ -222,8 +415,10 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("    compiler lex <file>");
     eprintln!("    compiler parse <file>");
-    eprintln!("    compiler check <file>");
-    eprintln!("    compiler ir <file>");
-    eprintln!("    compiler build <file> [-o <executable>]");
+    eprintln!("    compiler check <file> [-I <module-root>]");
+    eprintln!("    compiler ir <file> [-I <module-root>]");
+    eprintln!(
+        "    compiler build <file> [-o <executable>] [-I <module-root>] [-L <path>] [-l <library>] [--object <file>] [--target <triple>] [--linker <path>] [--link-arg <arg>] [-O <level>] [--depfile <path>] [--emit-object]"
+    );
     eprintln!("    compiler compile <file> [-o <executable>]");
 }

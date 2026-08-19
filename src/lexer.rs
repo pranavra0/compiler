@@ -23,9 +23,14 @@ pub enum TokenKind {
     Identifier,
     Integer,
     Float,
+    String,
+    Ellipsis,
 
     // Keywords
     Fn,
+    Import,
+    Extern,
+    Export,
     Let,
     Var,
     If,
@@ -37,6 +42,7 @@ pub enum TokenKind {
     While,
     Break,
     Continue,
+    Defer,
     For,
     True,
     False,
@@ -73,6 +79,7 @@ pub enum TokenKind {
     // Other operators
     Arrow,       // ->
     FatArrow,    // =>
+    Question,    // ? (explicit result propagation)
     ColonEqual,  // :=
     DoubleColon, // ::
 
@@ -98,8 +105,13 @@ impl fmt::Display for TokenKind {
             TokenKind::Identifier => "Identifier",
             TokenKind::Integer => "Integer",
             TokenKind::Float => "Float",
+            TokenKind::String => "String",
+            TokenKind::Ellipsis => "Ellipsis",
 
             TokenKind::Fn => "Fn",
+            TokenKind::Import => "Import",
+            TokenKind::Extern => "Extern",
+            TokenKind::Export => "Export",
             TokenKind::Let => "Let",
             TokenKind::Var => "Var",
             TokenKind::If => "If",
@@ -111,6 +123,7 @@ impl fmt::Display for TokenKind {
             TokenKind::While => "While",
             TokenKind::Break => "Break",
             TokenKind::Continue => "Continue",
+            TokenKind::Defer => "Defer",
             TokenKind::For => "For",
             TokenKind::True => "True",
             TokenKind::False => "False",
@@ -143,6 +156,7 @@ impl fmt::Display for TokenKind {
 
             TokenKind::Arrow => "Arrow",
             TokenKind::FatArrow => "FatArrow",
+            TokenKind::Question => "Question",
             TokenKind::DoubleColon => "DoubleColon",
 
             TokenKind::Dot => "Dot",
@@ -254,6 +268,13 @@ impl<'a> Lexer<'a> {
 
             b'=' => self.lex_equal(),
             b'!' => self.lex_bang(),
+            b'?' => self.single_character_token(TokenKind::Question),
+            b'"' => self.lex_string(),
+            b'.' if self.peek_next() == Some(b'.')
+                && self.bytes.get(self.position + 2) == Some(&b'.') =>
+            {
+                self.lex_ellipsis()
+            }
 
             b'<' => self.lex_less(),
             b'>' => self.lex_greater(),
@@ -313,6 +334,34 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read either an integer or floating-point litera
+    fn lex_string(&mut self) -> Token {
+        let start = self.position;
+        self.bump();
+        while let Some(byte) = self.peek() {
+            self.bump();
+            if byte == b'"' {
+                break;
+            }
+        }
+        Token::new(
+            TokenKind::String,
+            self.source,
+            Span::new(start, self.position),
+        )
+    }
+
+    fn lex_ellipsis(&mut self) -> Token {
+        let start = self.position;
+        self.bump();
+        self.bump();
+        self.bump();
+        Token::new(
+            TokenKind::Ellipsis,
+            self.source,
+            Span::new(start, self.position),
+        )
+    }
+
     fn lex_number(&mut self) -> Token {
         let start = self.position;
 
@@ -591,6 +640,9 @@ fn is_identifier_continue(byte: u8) -> bool {
 fn keyword_kind(text: &str) -> Option<TokenKind> {
     Some(match text {
         "fn" => TokenKind::Fn,
+        "import" => TokenKind::Import,
+        "extern" => TokenKind::Extern,
+        "export" => TokenKind::Export,
         "let" => TokenKind::Let,
         "var" => TokenKind::Var,
         "if" => TokenKind::If,
@@ -602,6 +654,7 @@ fn keyword_kind(text: &str) -> Option<TokenKind> {
         "while" => TokenKind::While,
         "break" => TokenKind::Break,
         "continue" => TokenKind::Continue,
+        "defer" => TokenKind::Defer,
         "for" => TokenKind::For,
         "true" => TokenKind::True,
         "false" => TokenKind::False,

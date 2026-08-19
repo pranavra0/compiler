@@ -62,6 +62,14 @@ pub enum SemanticError {
     ContinueOutsideLoop {
         span: Span,
     },
+    InvalidPropagation {
+        message: String,
+        span: Span,
+    },
+    InvalidDefer {
+        message: String,
+        span: Span,
+    },
     MissingReturn {
         function: String,
         span: Span,
@@ -71,6 +79,14 @@ pub enum SemanticError {
         span: Span,
     },
     InvalidEntryPoint {
+        message: String,
+        span: Span,
+    },
+    InvalidAbi {
+        abi: String,
+        span: Span,
+    },
+    InvalidFfiType {
         message: String,
         span: Span,
     },
@@ -104,6 +120,9 @@ impl fmt::Display for SemanticError {
             Self::InvalidAssignmentTarget { .. } => "invalid assignment target".into(),
             Self::BreakOutsideLoop { .. } => "break is only valid inside a loop".into(),
             Self::ContinueOutsideLoop { .. } => "continue is only valid inside a loop".into(),
+            Self::InvalidPropagation { message, .. } | Self::InvalidDefer { message, .. } => {
+                message.clone()
+            }
             Self::MissingReturn { function, .. } => {
                 format!("function `{function}` does not return a value on every path")
             }
@@ -111,6 +130,10 @@ impl fmt::Display for SemanticError {
                 format!("top-level variable `{name}` is not supported yet")
             }
             Self::InvalidEntryPoint { message, .. } => message.clone(),
+            Self::InvalidAbi { abi, .. } => {
+                format!("unsupported ABI `{abi}` (only `c` is supported)")
+            }
+            Self::InvalidFfiType { message, .. } => message.clone(),
         };
         let span = self.span();
         write!(f, "{text} at {}..{}", span.start, span.end)
@@ -132,9 +155,13 @@ impl SemanticError {
             | Self::InvalidAssignmentTarget { span }
             | Self::BreakOutsideLoop { span }
             | Self::ContinueOutsideLoop { span }
+            | Self::InvalidPropagation { span, .. }
+            | Self::InvalidDefer { span, .. }
             | Self::MissingReturn { span, .. }
             | Self::TopLevelVariableUnsupported { span, .. }
-            | Self::InvalidEntryPoint { span, .. } => *span,
+            | Self::InvalidEntryPoint { span, .. }
+            | Self::InvalidAbi { span, .. }
+            | Self::InvalidFfiType { span, .. } => *span,
         }
     }
 }
@@ -264,7 +291,9 @@ impl Analyzer {
         self.collect_values(program)?;
         for d in &program.declarations {
             if let Decl::Function(f) = d {
-                self.analyze_function(f)?
+                if !f.is_extern {
+                    self.analyze_function(f)?
+                }
             }
         }
         Ok(())
@@ -314,6 +343,24 @@ impl Analyzer {
         for d in &p.declarations {
             match d {
                 Decl::Function(f) => {
+                    if f.exported && f.abi.as_deref() != Some("c") {
+                        return Err(SemanticError::InvalidAbi {
+                            abi: "missing `c`".into(),
+                            span: f.span,
+                        });
+                    }
+                    if let Some(abi) = &f.abi {
+                        if abi != "c" {
+                            return Err(SemanticError::InvalidAbi {
+                                abi: abi.clone(),
+                                span: f.span,
+                            });
+                        }
+                        for parameter in &f.params {
+                            self.validate_ffi_type(&parameter.ty, parameter.span)?;
+                        }
+                        self.validate_ffi_type(&f.return_type, f.span)?;
+                    }
                     if names.insert(f.name.clone(), f.span).is_some() {
                         return Err(SemanticError::DuplicateName {
                             name: f.name.clone(),
@@ -437,7 +484,11 @@ impl Analyzer {
                     },
                     v.span,
                 )?;
-                Ok(Flow::NORMAL)
+                Ok(if expression_propagates(&v.value) {
+                    Flow::RETURN
+                } else {
+                    Flow::NORMAL
+                })
             }
             Stmt::Assignment { target, value, .. } => {
                 let (ty, mutable) = self.check_place(target)?;
@@ -449,10 +500,28 @@ impl Analyzer {
                 }
                 let actual = self.check_expression(value, Some(&ty))?;
                 self.expect_type(&ty, &actual, value.span())?;
-                Ok(Flow::NORMAL)
+                Ok(if expression_propagates(value) {
+                    Flow::RETURN
+                } else {
+                    Flow::NORMAL
+                })
             }
             Stmt::Expr { expression, .. } => {
                 self.check_expression(expression, None)?;
+                Ok(if expression_propagates(expression) {
+                    Flow::RETURN
+                } else {
+                    Flow::NORMAL
+                })
+            }
+            Stmt::Defer { call, span } => {
+                if !matches!(call, Expr::Call { .. }) {
+                    return Err(SemanticError::InvalidDefer {
+                        message: "defer requires a function call".into(),
+                        span: *span,
+                    });
+                }
+                self.check_expression(call, None)?;
                 Ok(Flow::NORMAL)
             }
             Stmt::Break { span } => {
@@ -569,6 +638,34 @@ impl Analyzer {
                 t
             }
             Expr::Bool { .. } => named("bool"),
+            Expr::Propagate { expression, span } => {
+                let actual = self.check_expression(expression, None)?;
+                let Type::Result { success, error } = actual else {
+                    return Err(SemanticError::InvalidPropagation {
+                        message: "`?` requires a result value".into(),
+                        span: *span,
+                    });
+                };
+                let Some(Type::Result {
+                    error: current_error,
+                    ..
+                }) = self.current_return_type.as_ref()
+                else {
+                    return Err(SemanticError::InvalidPropagation {
+                        message: "`?` requires a result-returning function".into(),
+                        span: *span,
+                    });
+                };
+                if **current_error != *error {
+                    return Err(SemanticError::InvalidPropagation {
+                        message:
+                            "propagated error type is incompatible with the current return type"
+                                .into(),
+                        span: *span,
+                    });
+                }
+                *success
+            }
             Expr::Null { span } => match expected {
                 Some(Type::Pointer(_)) => expected.cloned().unwrap(),
                 _ => {
@@ -816,6 +913,66 @@ impl Analyzer {
                         span: callee.span(),
                     });
                 };
+                if name == "return_ok"
+                    || name == "return_err"
+                    || name == "is_err"
+                    || name == "unwrap"
+                {
+                    let void_ok = name == "return_ok"
+                        && matches!(expected, Some(Type::Result { success, .. }) if is_unit(success));
+                    let expected_args = usize::from(!void_ok);
+                    if arguments.len() != expected_args {
+                        return Err(SemanticError::WrongArgumentCount {
+                            name: name.clone(),
+                            expected: expected_args,
+                            found: arguments.len(),
+                            span: *span,
+                        });
+                    }
+                    let arg = if void_ok {
+                        None
+                    } else {
+                        Some(self.check_expression(&arguments[0], None)?)
+                    };
+                    match name.as_str() {
+                        "is_err" => {
+                            if !matches!(arg.as_ref(), Some(Type::Result { .. })) {
+                                return Err(SemanticError::InvalidOperand {
+                                    message: "is_err requires a result value".into(),
+                                    span: *span,
+                                });
+                            }
+                            return Ok(named("bool"));
+                        }
+                        "unwrap" => {
+                            let Some(Type::Result { success, .. }) = arg else {
+                                return Err(SemanticError::InvalidOperand {
+                                    message: "unwrap requires a result value".into(),
+                                    span: *span,
+                                });
+                            };
+                            return Ok(*success);
+                        }
+                        "return_ok" | "return_err" => {
+                            let Some(Type::Result { success, error }) = expected else {
+                                return Err(SemanticError::InvalidOperand {
+                                    message: format!("{name} requires a result return context"),
+                                    span: *span,
+                                });
+                            };
+                            let wanted = if name == "return_ok" { success } else { error };
+                            if let Some(argument) = arguments.first() {
+                                let actual = self.check_expression(argument, Some(wanted))?;
+                                self.expect_type(wanted, &actual, argument.span())?;
+                            }
+                            return Ok(Type::Result {
+                                success: Box::new(*success.clone()),
+                                error: Box::new(*error.clone()),
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 if name == "make_slice" {
                     if arguments.len() != 2 {
                         return Err(SemanticError::WrongArgumentCount {
@@ -1078,6 +1235,60 @@ impl Analyzer {
     fn validate_return_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
         self.validate_type(t, span)
     }
+    fn validate_ffi_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
+        fn compatible(analyzer: &Analyzer, t: &Type, seen: &mut Vec<String>) -> bool {
+            match t {
+                Type::Unit => true,
+                Type::Named(name)
+                    if matches!(
+                        name.as_str(),
+                        "i8" | "i16"
+                            | "i32"
+                            | "i64"
+                            | "i128"
+                            | "u8"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "u128"
+                            | "usize"
+                            | "isize"
+                            | "f32"
+                            | "f64"
+                    ) =>
+                {
+                    true
+                }
+                Type::Named(name) => {
+                    if seen.contains(name) {
+                        return true;
+                    }
+                    let Some(info) = analyzer.structs.get(name) else {
+                        return false;
+                    };
+                    seen.push(name.clone());
+                    let result = info
+                        .fields
+                        .iter()
+                        .all(|(_, field)| compatible(analyzer, field, seen));
+                    seen.pop();
+                    result
+                }
+                Type::Pointer(element) => {
+                    **element == Type::Unit || compatible(analyzer, element, seen)
+                }
+                Type::Array { element, .. } => compatible(analyzer, element, seen),
+                Type::Slice(_) | Type::Result { .. } => false,
+            }
+        }
+        if compatible(self, t, &mut Vec::new()) {
+            return Ok(());
+        }
+        Err(SemanticError::InvalidFfiType {
+            message: format!("type `{}` is not representable in the C ABI", type_name(t)),
+            span,
+        })
+    }
     fn validate_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
         match t {
             Type::Unit => Ok(()),
@@ -1086,8 +1297,19 @@ impl Analyzer {
                 name: n.clone(),
                 span,
             }),
-            Type::Array { element, .. } | Type::Slice(element) | Type::Pointer(element) => {
+            Type::Array { element, .. } | Type::Slice(element) => {
                 self.validate_value_type(element, span)
+            }
+            Type::Pointer(element) => {
+                if is_unit(element) {
+                    Ok(())
+                } else {
+                    self.validate_value_type(element, span)
+                }
+            }
+            Type::Result { success, error } => {
+                self.validate_type(success, span)?;
+                self.validate_value_type(error, span)
             }
         }
     }
@@ -1518,6 +1740,10 @@ impl<'a> TypedLowerer<'a> {
             return_type: self.resolve(&f.return_type),
             body,
             span: f.span,
+            is_extern: f.is_extern,
+            abi: f.abi.clone(),
+            link_name: f.link_name.clone(),
+            exported: f.exported,
         })
     }
     fn lower_block(&mut self, b: &Block) -> Result<TypedBlock, SemanticError> {
@@ -1563,6 +1789,27 @@ impl<'a> TypedLowerer<'a> {
             },
             Stmt::Break { span } => TypedStmt::Break { span: *span },
             Stmt::Continue { span } => TypedStmt::Continue { span: *span },
+            Stmt::Defer { call, span } => {
+                let lowered = self.lower_expr(call, None)?;
+                let TypedExpr::Call {
+                    function,
+                    name,
+                    arguments,
+                    ..
+                } = lowered
+                else {
+                    return Err(SemanticError::InvalidDefer {
+                        message: "defer requires a named function call".into(),
+                        span: *span,
+                    });
+                };
+                TypedStmt::Defer {
+                    function,
+                    name,
+                    arguments,
+                    span: *span,
+                }
+            }
             Stmt::Return { value, span } => TypedStmt::Return {
                 value: value
                     .as_ref()
@@ -1732,6 +1979,10 @@ impl<'a> TypedLowerer<'a> {
                 Type::Pointer(Box::new(self.ast_from_resolved(element)))
             }
             ResolvedType::Slice(element) => Type::Slice(Box::new(self.ast_from_resolved(element))),
+            ResolvedType::Result { success, error } => Type::Result {
+                success: Box::new(self.ast_from_resolved(success)),
+                error: Box::new(self.ast_from_resolved(error)),
+            },
         }
     }
     fn lower_expr(
@@ -1763,6 +2014,38 @@ impl<'a> TypedLowerer<'a> {
                 ty: ResolvedType::Bool,
                 span,
             }),
+            Expr::Propagate { expression, .. } => {
+                let value = self.lower_expr(expression, None)?;
+                let ResolvedType::Result { success, error } = value.ty() else {
+                    return Err(SemanticError::InvalidPropagation {
+                        message: "`?` requires a result value".into(),
+                        span,
+                    });
+                };
+                let ResolvedType::Result {
+                    error: current_error,
+                    ..
+                } = &self.current_return_type
+                else {
+                    return Err(SemanticError::InvalidPropagation {
+                        message: "`?` requires a result-returning function".into(),
+                        span,
+                    });
+                };
+                if **current_error != *error {
+                    return Err(SemanticError::InvalidPropagation {
+                        message:
+                            "propagated error type is incompatible with the current return type"
+                                .into(),
+                        span,
+                    });
+                }
+                Ok(TypedExpr::Propagate {
+                    value: Box::new(value),
+                    ty: *success,
+                    span,
+                })
+            }
             Expr::Null { .. } => Ok(TypedExpr::Null {
                 ty: expected.ok_or_else(|| SemanticError::InvalidOperand {
                     message: "null requires a pointer context".into(),
@@ -1952,6 +2235,71 @@ impl<'a> TypedLowerer<'a> {
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     unreachable!()
                 };
+                if name == "return_ok"
+                    || name == "return_err"
+                    || name == "is_err"
+                    || name == "unwrap"
+                {
+                    let arg = arguments
+                        .first()
+                        .map(|a| self.lower_expr(a, None))
+                        .transpose()?;
+                    match name.as_str() {
+                        "is_err" => {
+                            return Ok(TypedExpr::IsErr {
+                                value: Box::new(arg.unwrap()),
+                                ty: ResolvedType::Bool,
+                                span,
+                            });
+                        }
+                        "unwrap" => {
+                            let arg = arg.unwrap();
+                            let ResolvedType::Result { success, .. } = arg.ty() else {
+                                unreachable!()
+                            };
+                            return Ok(TypedExpr::Unwrap {
+                                ty: *success,
+                                value: Box::new(arg),
+                                span,
+                            });
+                        }
+                        "return_ok" | "return_err" => {
+                            let ResolvedType::Result { success, error } =
+                                self.current_return_type.clone()
+                            else {
+                                unreachable!()
+                            };
+                            let wanted = if name == "return_ok" {
+                                *success.clone()
+                            } else {
+                                *error.clone()
+                            };
+                            let value = if let Some(argument) = arguments.first() {
+                                self.lower_expr(argument, Some(wanted))?
+                            } else {
+                                TypedExpr::Integer {
+                                    value: 0,
+                                    ty: int(8, false),
+                                    span,
+                                }
+                            };
+                            return Ok(if name == "return_ok" {
+                                TypedExpr::ResultOk {
+                                    value: Box::new(value),
+                                    ty: ResolvedType::Result { success, error },
+                                    span,
+                                }
+                            } else {
+                                TypedExpr::ResultErr {
+                                    value: Box::new(value),
+                                    ty: ResolvedType::Result { success, error },
+                                    span,
+                                }
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 if name == "make_slice" {
                     let pointer = if matches!(&arguments[0], Expr::Null { .. }) {
                         self.lower_expr(
@@ -2046,6 +2394,10 @@ impl<'a> TypedLowerer<'a> {
             },
             Type::Pointer(element) => ResolvedType::Pointer(Box::new(self.resolve(element))),
             Type::Slice(element) => ResolvedType::Slice(Box::new(self.resolve(element))),
+            Type::Result { success, error } => ResolvedType::Result {
+                success: Box::new(self.resolve(success)),
+                error: Box::new(self.resolve(error)),
+            },
         }
     }
 }
@@ -2062,7 +2414,10 @@ fn infer_ast_type_with_globals(e: &Expr, globals: &HashMap<String, (Type, bool)>
         Expr::ArrayLiteral { ty, .. } => ty.clone(),
         Expr::Null { .. } => Type::Pointer(Box::new(named("u8"))),
         Expr::SizeOf { .. } | Expr::AlignOf { .. } | Expr::OffsetOf { .. } => named("usize"),
-        Expr::UncheckedIndex { base, .. } => infer_ast_type_with_globals(base, globals),
+        Expr::UncheckedIndex { base, .. } | Expr::Index { base, .. } => {
+            infer_ast_type_with_globals(base, globals)
+        }
+        Expr::Propagate { expression, .. } => infer_ast_type_with_globals(expression, globals),
         Expr::Unary {
             operator, operand, ..
         } => match operator {
@@ -2076,7 +2431,24 @@ fn infer_ast_type_with_globals(e: &Expr, globals: &HashMap<String, (Type, bool)>
             _ => infer_ast_type_with_globals(operand, globals),
         },
         Expr::Binary { left, .. } => infer_ast_type_with_globals(left, globals),
+        Expr::Call { arguments, .. } if !arguments.is_empty() => {
+            infer_ast_type_with_globals(&arguments[0], globals)
+        }
         _ => named("i32"),
+    }
+}
+fn expression_propagates(e: &Expr) -> bool {
+    match e {
+        Expr::Propagate { .. } => true,
+        Expr::Call { arguments, .. } => arguments.iter().any(expression_propagates),
+        Expr::Binary { left, right, .. } => {
+            expression_propagates(left) || expression_propagates(right)
+        }
+        Expr::Unary { operand, .. } => expression_propagates(operand),
+        Expr::Field { base, .. } | Expr::Index { base, .. } | Expr::UncheckedIndex { base, .. } => {
+            expression_propagates(base)
+        }
+        _ => false,
     }
 }
 fn place_name(e: &Expr) -> String {
@@ -2209,6 +2581,7 @@ fn type_name(t: &Type) -> String {
         Type::Array { length, element } => format!("[{length}]{}", type_name(element)),
         Type::Pointer(element) => format!("*{}", type_name(element)),
         Type::Slice(element) => format!("[]{}", type_name(element)),
+        Type::Result { success, error } => format!("{} | {}", type_name(success), type_name(error)),
     }
 }
 fn is_bool(t: &Type) -> bool {

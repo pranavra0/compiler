@@ -1,0 +1,4 @@
+// Imported declarations are explicit and qualified by the module name.
+export "c" add :: (a: i32, b: i32) -> i32 {
+    return a + b;
+}

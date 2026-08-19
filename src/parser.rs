@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::ast::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, Parameter, Program, Stmt, StructDecl, StructField,
-    StructInit, Type, UnaryOp, VariableDecl, VariableKind,
+    BinaryOp, Block, Decl, Expr, FunctionDecl, ImportDecl, Parameter, Program, Stmt, StructDecl,
+    StructField, StructInit, Type, UnaryOp, VariableDecl, VariableKind,
 };
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -34,6 +34,11 @@ pub enum ParseError {
     },
 
     InvalidAssignmentTarget {
+        span: Span,
+    },
+
+    Unsupported {
+        message: String,
         span: Span,
     },
 }
@@ -88,6 +93,9 @@ impl fmt::Display for ParseError {
                     span.start, span.end
                 )
             }
+            ParseError::Unsupported { message, span } => {
+                write!(f, "{message} at {}..{}", span.start, span.end)
+            }
         }
     }
 }
@@ -108,27 +116,110 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Program, ParseError> {
+        let mut imports = Vec::new();
         let mut declarations = Vec::new();
-
         while !self.at(TokenKind::Eof) {
-            declarations.push(self.parse_declaration()?);
+            if self.at(TokenKind::Import) {
+                imports.push(self.parse_import()?);
+            } else {
+                declarations.push(self.parse_declaration()?);
+            }
         }
+        Ok(Program {
+            imports,
+            declarations,
+        })
+    }
 
-        Ok(Program { declarations })
+    fn parse_import(&mut self) -> Result<ImportDecl, ParseError> {
+        let start = self.expect(TokenKind::Import)?.span.start;
+        let token = if self.at(TokenKind::String) || self.at(TokenKind::Identifier) {
+            self.advance().clone()
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "module name or string path".into(),
+                found: self.current().kind,
+                span: self.current().span,
+            });
+        };
+        let path = token.lexeme.trim_matches('"').to_string();
+        let alias = path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&path)
+            .trim_end_matches(".compy")
+            .to_string();
+        let end = self.expect(TokenKind::Semicolon)?.span.end;
+        Ok(ImportDecl {
+            path,
+            alias,
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_declaration(&mut self) -> Result<Decl, ParseError> {
-        let fn_start = self.current().span.start;
+        let start_token = self.current().clone();
+        let mut is_extern = false;
+        let mut is_export = false;
+        loop {
+            if self.match_token(TokenKind::Extern) {
+                is_extern = true;
+                continue;
+            }
+            if self.match_token(TokenKind::Export) {
+                is_export = true;
+                continue;
+            }
+            break;
+        }
+        let abi = if is_extern || is_export {
+            if self.at(TokenKind::String) {
+                Some(self.advance().lexeme.trim_matches('"').to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let fn_start = start_token.span.start;
         let has_fn_keyword = self.match_token(TokenKind::Fn);
         let name = self.expect_identifier()?;
-        let start = if has_fn_keyword {
+        let start = if has_fn_keyword || is_extern || is_export {
             fn_start
         } else {
             name.span.start
         };
 
-        if has_fn_keyword {
-            return Ok(Decl::Function(self.parse_function_after_name(name, start)?));
+        if has_fn_keyword || is_extern {
+            return Ok(Decl::Function(self.parse_function_after_name(
+                name, start, is_extern, abi, is_export,
+            )?));
+        }
+        if is_export {
+            if abi.is_some() && !self.at(TokenKind::DoubleColon) {
+                return Err(ParseError::Unsupported {
+                    message: "an ABI string is only valid on exported functions".into(),
+                    span: start_token.span,
+                });
+            }
+            self.expect(TokenKind::DoubleColon)?;
+            if abi.is_some() && !self.at(TokenKind::LParen) {
+                return Err(ParseError::Unsupported {
+                    message: "an ABI string is only valid on exported functions".into(),
+                    span: start_token.span,
+                });
+            }
+            if self.at(TokenKind::LParen) {
+                return Ok(Decl::Function(
+                    self.parse_function_after_name(name, start, false, abi, true)?,
+                ));
+            }
+            if self.at(TokenKind::Struct) {
+                let mut structure = self.parse_struct_after_name(name, start)?;
+                structure.exported = true;
+                return Ok(Decl::Struct(structure));
+            }
+            return self.parse_variable_after_operator(name, start, TokenKind::DoubleColon, true);
         }
 
         let operator = if self.at(TokenKind::DoubleColon) {
@@ -140,13 +231,24 @@ impl Parser {
         };
 
         if operator == TokenKind::DoubleColon && self.at(TokenKind::LParen) {
-            return Ok(Decl::Function(self.parse_function_after_name(name, start)?));
+            return Ok(Decl::Function(
+                self.parse_function_after_name(name, start, false, None, false)?,
+            ));
         }
         if operator == TokenKind::DoubleColon && self.at(TokenKind::Struct) {
             return Ok(Decl::Struct(self.parse_struct_after_name(name, start)?));
         }
 
-        // `name :: T = value` is the explicitly typed constant form.
+        self.parse_variable_after_operator(name, start, operator, false)
+    }
+
+    fn parse_variable_after_operator(
+        &mut self,
+        name: Token,
+        start: usize,
+        operator: TokenKind,
+        exported: bool,
+    ) -> Result<Decl, ParseError> {
         let typed = self.looks_like_typed_declaration();
         let ty = if typed {
             Some(self.parse_type()?)
@@ -169,6 +271,7 @@ impl Parser {
             ty,
             value,
             span,
+            exported,
         }))
     }
 
@@ -176,6 +279,9 @@ impl Parser {
         &mut self,
         name: Token,
         start: usize,
+        is_extern: bool,
+        abi: Option<String>,
+        exported: bool,
     ) -> Result<FunctionDecl, ParseError> {
         self.expect(TokenKind::LParen)?;
 
@@ -183,6 +289,12 @@ impl Parser {
 
         if !self.at(TokenKind::RParen) {
             loop {
+                if self.at(TokenKind::Ellipsis) {
+                    return Err(ParseError::Unsupported {
+                        message: "variadic foreign functions are not implemented".into(),
+                        span: self.current().span,
+                    });
+                }
                 params.push(self.parse_parameter()?);
 
                 if !self.match_token(TokenKind::Comma) {
@@ -203,14 +315,26 @@ impl Parser {
             Type::Unit
         };
 
-        let body = self.parse_block()?;
+        let body = if is_extern {
+            let end = self.expect(TokenKind::Semicolon)?.span.end;
+            Block {
+                statements: Vec::new(),
+                span: Span::new(start, end),
+            }
+        } else {
+            self.parse_block()?
+        };
 
         Ok(FunctionDecl {
-            name: name.lexeme,
+            name: name.lexeme.clone(),
             params,
             return_type,
             body: body.clone(),
             span: Span::new(start, body.span.end),
+            is_extern,
+            abi,
+            link_name: (is_extern || exported).then(|| name.lexeme.clone()),
+            exported,
         })
     }
 
@@ -230,12 +354,47 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        let mut ty = if self.match_token(TokenKind::Star) {
+            Type::Pointer(Box::new(self.parse_type_atom()?))
+        } else if self.match_token(TokenKind::LBracket) {
+            if self.match_token(TokenKind::RBracket) {
+                Type::Slice(Box::new(self.parse_type_atom()?))
+            } else {
+                let token = self.expect(TokenKind::Integer)?;
+                let length = token.lexeme.replace('_', "").parse::<u64>().map_err(|_| {
+                    ParseError::InvalidInteger {
+                        lexeme: token.lexeme.clone(),
+                        span: token.span,
+                    }
+                })?;
+                self.expect(TokenKind::RBracket)?;
+                Type::Array {
+                    length,
+                    element: Box::new(self.parse_type_atom()?),
+                }
+            }
+        } else {
+            self.parse_type_atom()?
+        };
+        // Result types are right associative: T | E.  The error arm is a
+        // type as well, which permits named error structs and void.
+        if self.match_token(TokenKind::Pipe) {
+            let error = self.parse_type()?;
+            ty = Type::Result {
+                success: Box::new(ty),
+                error: Box::new(error),
+            };
+        }
+        Ok(ty)
+    }
+
+    fn parse_type_atom(&mut self) -> Result<Type, ParseError> {
         if self.match_token(TokenKind::Star) {
-            return Ok(Type::Pointer(Box::new(self.parse_type()?)));
+            return Ok(Type::Pointer(Box::new(self.parse_type_atom()?)));
         }
         if self.match_token(TokenKind::LBracket) {
             if self.match_token(TokenKind::RBracket) {
-                return Ok(Type::Slice(Box::new(self.parse_type()?)));
+                return Ok(Type::Slice(Box::new(self.parse_type_atom()?)));
             }
             let token = self.expect(TokenKind::Integer)?;
             let length = token.lexeme.replace('_', "").parse::<u64>().map_err(|_| {
@@ -245,14 +404,18 @@ impl Parser {
                 }
             })?;
             self.expect(TokenKind::RBracket)?;
-            let element = self.parse_type()?;
             return Ok(Type::Array {
                 length,
-                element: Box::new(element),
+                element: Box::new(self.parse_type_atom()?),
             });
         }
-        let token = self.expect_identifier()?;
-        Ok(Type::Named(token.lexeme))
+        let first = self.expect_identifier()?;
+        if self.match_token(TokenKind::Dot) {
+            let second = self.expect_identifier()?;
+            Ok(Type::Named(format!("{}.{}", first.lexeme, second.lexeme)))
+        } else {
+            Ok(Type::Named(first.lexeme))
+        }
     }
 
     fn parse_struct_after_name(
@@ -284,6 +447,7 @@ impl Parser {
             name: name.lexeme,
             fields,
             span: Span::new(start, closing.span.end),
+            exported: false,
         })
     }
 
@@ -324,6 +488,23 @@ impl Parser {
 
         if self.at(TokenKind::Continue) {
             return self.parse_loop_control_statement(false);
+        }
+
+        if self.at(TokenKind::Defer) {
+            let start = self.advance().span.start;
+            let call = self.parse_expression()?;
+            if !matches!(call, Expr::Call { .. }) {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "deferred function call".into(),
+                    found: self.current().kind,
+                    span: call.span(),
+                });
+            }
+            let end = self.expect(TokenKind::Semicolon)?.span.end;
+            return Ok(Stmt::Defer {
+                call,
+                span: Span::new(start, end),
+            });
         }
 
         if self.at(TokenKind::Let) || self.at(TokenKind::Var) {
@@ -512,6 +693,7 @@ impl Parser {
             ty,
             value,
             span: Span::new(start, end),
+            exported: false,
         }))
     }
 
@@ -593,6 +775,14 @@ impl Parser {
                 expression = Expr::Index {
                     base: Box::new(expression),
                     index: Box::new(index),
+                    span,
+                };
+                continue;
+            }
+            if self.match_token(TokenKind::Question) {
+                let span = Span::new(expression.span().start, self.previous().span.end);
+                expression = Expr::Propagate {
+                    expression: Box::new(expression),
                     span,
                 };
                 continue;
@@ -729,6 +919,11 @@ impl Parser {
 
             TokenKind::Identifier => {
                 self.advance();
+                let mut qualified_name = token.lexeme.clone();
+                if self.match_token(TokenKind::Dot) {
+                    let part = self.expect_identifier()?;
+                    qualified_name = format!("{}.{}", qualified_name, part.lexeme);
+                }
                 if self.at(TokenKind::LBrace)
                     && (self.peek_kind(1) == Some(TokenKind::RBrace)
                         || (self.peek_kind(1) == Some(TokenKind::Identifier)
@@ -759,15 +954,27 @@ impl Parser {
                     }
                     let closing = self.expect(TokenKind::RBrace)?;
                     return Ok(Expr::StructLiteral {
-                        name: token.lexeme,
+                        name: qualified_name,
                         fields,
                         span: Span::new(token.span.start, closing.span.end),
                     });
                 }
-                Ok(Expr::Identifier {
-                    name: token.lexeme,
-                    span: token.span,
-                })
+                if qualified_name != token.lexeme {
+                    let span = Span::new(token.span.start, self.previous().span.end);
+                    Ok(Expr::Field {
+                        base: Box::new(Expr::Identifier {
+                            name: token.lexeme,
+                            span: token.span,
+                        }),
+                        name: qualified_name.split('.').nth(1).unwrap().to_string(),
+                        span,
+                    })
+                } else {
+                    Ok(Expr::Identifier {
+                        name: token.lexeme,
+                        span: token.span,
+                    })
+                }
             }
 
             TokenKind::LBracket => {
@@ -859,6 +1066,7 @@ impl Parser {
             match tokens.get(position)?.kind {
                 TokenKind::Identifier => Some(position + 1),
                 TokenKind::Star => type_end(tokens, position + 1),
+                TokenKind::Pipe => type_end(tokens, position + 1),
                 TokenKind::LBracket => {
                     if tokens.get(position + 1)?.kind == TokenKind::RBracket {
                         return type_end(tokens, position + 2);

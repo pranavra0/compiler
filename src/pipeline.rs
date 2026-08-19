@@ -34,7 +34,8 @@ impl FrontendError {
                 | ParseError::InvalidInteger { span, .. }
                 | ParseError::InvalidFloat { span, .. }
                 | ParseError::InvalidDeclaration { span }
-                | ParseError::InvalidAssignmentTarget { span } => *span,
+                | ParseError::InvalidAssignmentTarget { span }
+                | ParseError::Unsupported { span, .. } => *span,
             },
             Self::Semantic(error) => error.span(),
         }
@@ -88,7 +89,15 @@ pub fn parse_source(source: &str) -> Result<Program, FrontendError> {
 }
 
 pub fn analyze_program(program: &Program) -> Result<TypedProgram, FrontendError> {
-    semantic::analyze_typed(program).map_err(FrontendError::Semantic)
+    analyze_program_with_pointer_width(program, usize::BITS)
+}
+
+pub fn analyze_program_with_pointer_width(
+    program: &Program,
+    pointer_width: u32,
+) -> Result<TypedProgram, FrontendError> {
+    semantic::analyze_typed_with_pointer_width(program, pointer_width)
+        .map_err(FrontendError::Semantic)
 }
 
 pub fn analyze_source(source: &str) -> Result<TypedProgram, FrontendError> {

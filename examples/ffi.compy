@@ -1,0 +1,11 @@
+// Hand-written C declarations use the C ABI explicitly.
+extern "c" abs(value: i32) -> i32;
+
+// Exported symbols retain the C link name `add`.
+export "c" add :: (a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+main :: () -> i32 {
+    return abs(add(-4, 1));
+}
