@@ -89,6 +89,11 @@ pub enum Expr {
         span: Span,
     },
 
+    Bool {
+        value: bool,
+        span: Span,
+    },
+
     Identifier {
         name: String,
         span: Span,
@@ -119,6 +124,7 @@ impl Expr {
         match self {
             Expr::Integer { span, .. } => *span,
             Expr::Float { span, .. } => *span,
+            Expr::Bool { span, .. } => *span,
             Expr::Identifier { span, .. } => *span,
             Expr::Unary { span, .. } => *span,
             Expr::Binary { span, .. } => *span,

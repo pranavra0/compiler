@@ -532,6 +532,15 @@ impl Parser {
                 })
             }
 
+            TokenKind::True | TokenKind::False => {
+                self.advance();
+
+                Ok(Expr::Bool {
+                    value: token.kind == TokenKind::True,
+                    span: token.span,
+                })
+            }
+
             TokenKind::Identifier => {
                 self.advance();
 
