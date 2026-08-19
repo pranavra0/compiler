@@ -1,10 +1,12 @@
 // my first program.
 
-fn main() {
-    let answer = 42;
-    let other = 10.5;
+main :: () -> i32 {
+    answer := 42;
+    other : f64 = 10.5;
 
     if answer >= 40 {
-        return;
+        return answer;
     }
+
+    return 0;
 }
