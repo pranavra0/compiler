@@ -4,3 +4,6 @@ I've made an interpreter before with pp, never a compiler. Alongside that, there
 
 I think it would be good to make a compiler for maximal expressiveness in programs. Not sure how this will go. For now I have a rough langauge spec and will be adapting that to Kaleidoscope https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl01.html
 
+---
+
+Just added the lexer. Match statements make this quite simple. 

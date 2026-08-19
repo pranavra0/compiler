@@ -1,0 +1,10 @@
+// my first program.
+
+fn main() {
+    let answer = 42;
+    let other = 10.5;
+
+    if answer >= 40 {
+        return;
+    }
+}
