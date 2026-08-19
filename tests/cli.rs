@@ -96,3 +96,89 @@ fn build_executable_preserves_exit_code() {
     let _ = fs::remove_file(&output_root);
     let _ = fs::remove_file(output_root.with_extension("o"));
 }
+
+#[test]
+fn builds_and_runs_core_loop_programs() {
+    let cases = [
+        (
+            "count",
+            10,
+            "main :: () -> i32 { i := 0; while i < 10 { i = i + 1; } return i; }",
+        ),
+        (
+            "break",
+            7,
+            "main :: () -> i32 { i := 0; while true { if i == 7 { break; } i = i + 1; } return i; }",
+        ),
+        (
+            "continue",
+            50,
+            "main :: () -> i32 { i := 0; sum := 0; while i < 10 { i = i + 1; if i == 5 { continue; } sum = sum + i; } return sum; }",
+        ),
+        (
+            "nested",
+            6,
+            "main :: () -> i32 { total := 0; i := 0; while i < 3 { i = i + 1; j := 0; while j < 3 { j = j + 1; if j == 1 { continue; } break; } total = total + i; } return total; }",
+        ),
+        (
+            "return",
+            9,
+            "main :: () -> i32 { i := 0; while i < 3 { if i == 1 { return 9; } i = i + 1; } return 0; }",
+        ),
+        (
+            "followed_by_return",
+            4,
+            "main :: () -> i32 { i := 0; while i < 0 { i = i + 1; } return 4; }",
+        ),
+    ];
+
+    for (label, expected, source) in cases {
+        let (source_path, output_root) = paths(label);
+        fs::write(&source_path, source).unwrap();
+
+        let build = compiler()
+            .args(["build"])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&output_root)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{label} build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_root).status().unwrap();
+        assert_eq!(run.code(), Some(expected), "incorrect result for {label}");
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(&output_root);
+        let _ = fs::remove_file(output_root.with_extension("o"));
+    }
+}
+
+#[test]
+fn rejects_invalid_loop_programs_before_codegen() {
+    let cases = [
+        "main :: () -> i32 { break; return 0; }",
+        "main :: () -> i32 { continue; return 0; }",
+        "main :: () -> i32 { while 1 { break; } return 0; }",
+    ];
+
+    for (index, source) in cases.iter().enumerate() {
+        let (source_path, output_root) = paths(&format!("loop_invalid_{index}"));
+        fs::write(&source_path, source).unwrap();
+
+        let result = compiler().arg("build").arg(&source_path).output().unwrap();
+        assert!(!result.status.success(), "invalid loop accepted: {source}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("semantic error"),
+            "missing semantic diagnostic for {source}"
+        );
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(&output_root);
+        let _ = fs::remove_file(output_root.with_extension("o"));
+    }
+}

@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
 
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::BuilderError;
 use inkwell::context::Context;
 use inkwell::module::Module;
@@ -62,6 +63,34 @@ struct Local<'ctx> {
     mutable: bool,
 }
 
+#[derive(Clone, Copy)]
+struct LoopTargets<'ctx> {
+    continue_block: BasicBlock<'ctx>,
+    break_block: BasicBlock<'ctx>,
+}
+
+#[derive(Clone, Copy)]
+struct Flow(u8);
+
+impl Flow {
+    const NORMAL: Self = Self(1);
+    const RETURN: Self = Self(2);
+    const BREAK: Self = Self(4);
+    const CONTINUE: Self = Self(8);
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
 /// Generates LLVM IR directly from the AST
 pub struct CodeGenerator<'ctx> {
     context: &'ctx Context,
@@ -71,6 +100,7 @@ pub struct CodeGenerator<'ctx> {
     function_return_types: HashMap<String, Type>,
     current_return_type: Option<BasicTypeEnum<'ctx>>,
     pointer_width: u32,
+    loop_targets: Vec<LoopTargets<'ctx>>,
 }
 
 impl<'ctx> CodeGenerator<'ctx> {
@@ -94,6 +124,7 @@ impl<'ctx> CodeGenerator<'ctx> {
             function_return_types: HashMap::new(),
             current_return_type: None,
             pointer_width,
+            loop_targets: Vec::new(),
         }
     }
 
@@ -170,6 +201,7 @@ impl<'ctx> CodeGenerator<'ctx> {
         let entry = self.context.append_basic_block(llvm_function, "entry");
         self.builder.position_at_end(entry);
         self.locals.clear();
+        self.loop_targets.clear();
         self.current_return_type = if is_void(&function.return_type) {
             None
         } else {
@@ -200,9 +232,9 @@ impl<'ctx> CodeGenerator<'ctx> {
             );
         }
 
-        let terminated = self.generate_block(&function.body)?;
+        let flow = self.generate_block(&function.body)?;
 
-        if !terminated {
+        if flow.contains(Flow::NORMAL) {
             if self.current_return_type.is_some() {
                 return Err(CodegenError::at(
                     format!(
@@ -226,27 +258,30 @@ impl<'ctx> CodeGenerator<'ctx> {
         Ok(())
     }
 
-    /// Returns true when every path through the block has terminated.
-    fn generate_block(&mut self, block: &Block) -> Result<bool, CodegenError> {
+    /// Returns the possible exits from a block. Only statements on paths that
+    /// can still fall through are emitted; semantic analysis has already
+    /// checked unreachable statements.
+    fn generate_block(&mut self, block: &Block) -> Result<Flow, CodegenError> {
         // Keep lexical bindings local to this block. Stores through a binding
         // from an outer scope still affect the same alloca, while a shadowing
         // declaration disappears when the block ends.
         let saved_locals = self.locals.clone();
         let result = (|| {
+            let mut flow = Flow::NORMAL;
             for statement in &block.statements {
-                if self.generate_statement(statement)? {
-                    return Ok(true);
+                if flow.contains(Flow::NORMAL) {
+                    let statement_flow = self.generate_statement(statement)?;
+                    flow = flow.without(Flow::NORMAL).union(statement_flow);
                 }
             }
-
-            Ok(false)
+            Ok(flow)
         })();
         self.locals = saved_locals;
         result
     }
 
-    /// Returns true for a statement that terminates its current basic block.
-    fn generate_statement(&mut self, statement: &Stmt) -> Result<bool, CodegenError> {
+    /// Returns the possible exits from a statement.
+    fn generate_statement(&mut self, statement: &Stmt) -> Result<Flow, CodegenError> {
         match statement {
             Stmt::Return { value, span } => {
                 match (self.current_return_type, value) {
@@ -276,7 +311,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     }
                 }
 
-                Ok(true)
+                Ok(Flow::RETURN)
             }
 
             Stmt::Variable(variable) => {
@@ -322,7 +357,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     },
                 );
 
-                Ok(false)
+                Ok(Flow::NORMAL)
             }
 
             Stmt::Assignment {
@@ -364,7 +399,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     .build_store(local.pointer, new_value)
                     .map_err(builder_error)?;
 
-                Ok(false)
+                Ok(Flow::NORMAL)
             }
 
             Stmt::Expr { expression, .. } => {
@@ -374,8 +409,36 @@ impl<'ctx> CodeGenerator<'ctx> {
                     self.generate_expression(expression, None)?;
                 }
 
-                Ok(false)
+                Ok(Flow::NORMAL)
             }
+
+            Stmt::Break { span } => {
+                let targets = self
+                    .loop_targets
+                    .last()
+                    .copied()
+                    .ok_or_else(|| CodegenError::at("break is outside a loop", *span))?;
+                self.builder
+                    .build_unconditional_branch(targets.break_block)
+                    .map_err(builder_error)?;
+                Ok(Flow::BREAK)
+            }
+
+            Stmt::Continue { span } => {
+                let targets = self
+                    .loop_targets
+                    .last()
+                    .copied()
+                    .ok_or_else(|| CodegenError::at("continue is outside a loop", *span))?;
+                self.builder
+                    .build_unconditional_branch(targets.continue_block)
+                    .map_err(builder_error)?;
+                Ok(Flow::CONTINUE)
+            }
+
+            Stmt::While {
+                condition, body, ..
+            } => self.generate_while(condition, body),
 
             Stmt::If {
                 condition,
@@ -391,9 +454,10 @@ impl<'ctx> CodeGenerator<'ctx> {
         condition: &Expr,
         then_branch: &Block,
         else_branch: Option<&Block>,
-    ) -> Result<bool, CodegenError> {
+    ) -> Result<Flow, CodegenError> {
         let condition_span = condition.span();
-        let condition = self.generate_expression(condition, None)?;
+        let condition =
+            self.generate_expression(condition, Some(self.context.bool_type().into()))?;
         let condition = self.as_condition(condition, condition_span)?;
         let function = self
             .current_function()
@@ -408,32 +472,92 @@ impl<'ctx> CodeGenerator<'ctx> {
             .map_err(builder_error)?;
 
         self.builder.position_at_end(then_block);
-        let then_terminated = self.generate_block(then_branch)?;
-        if !then_terminated {
+        let then_flow = self.generate_block(then_branch)?;
+        if then_flow.contains(Flow::NORMAL) {
             self.builder
                 .build_unconditional_branch(merge_block)
                 .map_err(builder_error)?;
         }
 
         self.builder.position_at_end(else_block);
-        let else_terminated = match else_branch {
+        let else_flow = match else_branch {
             Some(block) => self.generate_block(block)?,
-            None => false,
+            None => Flow::NORMAL,
         };
-        if !else_terminated {
+        if else_flow.contains(Flow::NORMAL) {
             self.builder
                 .build_unconditional_branch(merge_block)
                 .map_err(builder_error)?;
         }
 
-        let all_paths_terminate = then_terminated && else_branch.is_some() && else_terminated;
+        let flow = then_flow.union(else_flow);
         self.builder.position_at_end(merge_block);
 
-        if all_paths_terminate {
+        if !flow.contains(Flow::NORMAL) {
             self.builder.build_unreachable().map_err(builder_error)?;
         }
 
-        Ok(all_paths_terminate)
+        Ok(flow)
+    }
+
+    fn generate_while(&mut self, condition: &Expr, body: &Block) -> Result<Flow, CodegenError> {
+        let function = self
+            .current_function()
+            .ok_or_else(|| CodegenError::new("loop generated outside a function"))?;
+        let condition_block = self.context.append_basic_block(function, "while.cond");
+        let body_block = self.context.append_basic_block(function, "while.body");
+        let end_block = self.context.append_basic_block(function, "while.end");
+
+        self.builder
+            .build_unconditional_branch(condition_block)
+            .map_err(builder_error)?;
+        self.builder.position_at_end(condition_block);
+
+        let condition_span = condition.span();
+        let condition_value =
+            self.generate_expression(condition, Some(self.context.bool_type().into()))?;
+        let condition_value = self.as_condition(condition_value, condition_span)?;
+        let statically_true = matches!(condition, Expr::Bool { value: true, .. });
+        if statically_true {
+            self.builder
+                .build_unconditional_branch(body_block)
+                .map_err(builder_error)?;
+        } else {
+            self.builder
+                .build_conditional_branch(condition_value, body_block, end_block)
+                .map_err(builder_error)?;
+        }
+
+        self.loop_targets.push(LoopTargets {
+            continue_block: condition_block,
+            break_block: end_block,
+        });
+        self.builder.position_at_end(body_block);
+        let body_result = self.generate_block(body);
+        self.loop_targets.pop();
+        let body_flow = body_result?;
+
+        if body_flow.contains(Flow::NORMAL) {
+            self.builder
+                .build_unconditional_branch(condition_block)
+                .map_err(builder_error)?;
+        }
+
+        self.builder.position_at_end(end_block);
+        let has_exit = !statically_true || body_flow.contains(Flow::BREAK);
+        if statically_true && !has_exit {
+            self.builder.build_unreachable().map_err(builder_error)?;
+        }
+
+        let mut flow = if body_flow.contains(Flow::RETURN) {
+            Flow::RETURN
+        } else {
+            Flow(0)
+        };
+        if has_exit {
+            flow = flow.union(Flow::NORMAL);
+        }
+        Ok(flow)
     }
 
     fn generate_expression(
@@ -444,7 +568,11 @@ impl<'ctx> CodeGenerator<'ctx> {
         match expression {
             Expr::Integer { value, span } => {
                 let integer_type = match expected_type {
-                    Some(BasicTypeEnum::IntType(integer_type)) => integer_type,
+                    Some(BasicTypeEnum::IntType(integer_type))
+                        if integer_type.get_bit_width() != 1 =>
+                    {
+                        integer_type
+                    }
                     Some(other) => {
                         return Err(CodegenError::at(
                             format!("integer literal cannot have type {other}"),
@@ -888,28 +1016,7 @@ impl<'ctx> CodeGenerator<'ctx> {
     ) -> Result<IntValue<'ctx>, CodegenError> {
         match value {
             BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => Ok(value),
-            BasicValueEnum::IntValue(value) => self
-                .builder
-                .build_int_compare(
-                    IntPredicate::NE,
-                    value,
-                    value.get_type().const_zero(),
-                    "ifcond",
-                )
-                .map_err(builder_error),
-            BasicValueEnum::FloatValue(value) => self
-                .builder
-                .build_float_compare(
-                    FloatPredicate::ONE,
-                    value,
-                    value.get_type().const_zero(),
-                    "ifcond",
-                )
-                .map_err(builder_error),
-            _ => Err(CodegenError::at(
-                "if condition must be an integer or floating-point value",
-                span,
-            )),
+            _ => Err(CodegenError::at("condition must be a bool", span)),
         }
     }
 
@@ -1108,5 +1215,43 @@ mod tests {
         assert!(ir.contains("logical.short"));
         assert!(ir.contains("phi i1"));
         assert!(!ir.contains("and i1"));
+    }
+
+    #[test]
+    fn lowers_while_with_loop_control_targets() {
+        let ir = generate(
+            r#"
+            main :: () -> i32 {
+                i := 0;
+                while i < 10 {
+                    i = i + 1;
+                    if i == 3 {
+                        continue;
+                    }
+                    if i == 7 {
+                        break;
+                    }
+                }
+                return i;
+            }
+            "#,
+        );
+
+        assert!(ir.contains("while.cond"));
+        assert!(ir.contains("while.body"));
+        assert!(ir.contains("while.end"));
+        assert!(ir.contains("br label %while.cond"));
+        assert!(ir.contains("br label %while.end"));
+    }
+
+    #[test]
+    fn verifies_infinite_loop_cfgs() {
+        let ir = generate("spin :: () -> i32 { while true { continue; } }");
+        assert!(ir.contains("while.cond"));
+        assert!(ir.contains("unreachable"));
+
+        let ir = generate("main :: () -> i32 { while true { break; } return 3; }");
+        assert!(ir.contains("while.end"));
+        assert!(ir.contains("ret i32 3"));
     }
 }

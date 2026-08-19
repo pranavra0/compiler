@@ -51,6 +51,12 @@ pub enum SemanticError {
     InvalidAssignmentTarget {
         span: Span,
     },
+    BreakOutsideLoop {
+        span: Span,
+    },
+    ContinueOutsideLoop {
+        span: Span,
+    },
     MissingReturn {
         function: String,
         span: Span,
@@ -120,6 +126,16 @@ impl fmt::Display for SemanticError {
                     span.start, span.end
                 )
             }
+            Self::BreakOutsideLoop { span } => write!(
+                f,
+                "break is only valid inside a loop at {}..{}",
+                span.start, span.end
+            ),
+            Self::ContinueOutsideLoop { span } => write!(
+                f,
+                "continue is only valid inside a loop at {}..{}",
+                span.start, span.end
+            ),
             Self::MissingReturn { function, span } => write!(
                 f,
                 "function `{function}` does not return a value on every path at {}..{}",
@@ -148,6 +164,28 @@ struct Variable {
     mutable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flow(u8);
+
+impl Flow {
+    const NORMAL: Self = Self(1);
+    const RETURN: Self = Self(2);
+    const BREAK: Self = Self(4);
+    const CONTINUE: Self = Self(8);
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
 /// Performs name resolution and the type rules which are independent of a
 /// backend.  The analyzer deliberately does not rewrite the AST yet; its
 /// result is a validated program ready for lowering.
@@ -156,6 +194,7 @@ pub struct Analyzer {
     scopes: Vec<HashMap<String, Variable>>,
     current_return_type: Option<Type>,
     current_function: Option<String>,
+    loop_depth: usize,
 }
 
 /// Analyze a complete program using the language's semantic rules.
@@ -170,6 +209,7 @@ impl Analyzer {
             scopes: Vec::new(),
             current_return_type: None,
             current_function: None,
+            loop_depth: 0,
         }
     }
 
@@ -250,13 +290,15 @@ impl Analyzer {
 
         // Parameters and declarations directly in the function body share one
         // lexical scope, so a local cannot silently redeclare a parameter.
-        let returns = self.analyze_block_contents(&function.body)?;
+        self.loop_depth = 0;
+        let flow = self.analyze_block_contents(&function.body)?;
         self.scopes.pop();
 
         self.current_return_type = None;
         self.current_function = None;
+        self.loop_depth = 0;
 
-        if !is_unit(&function.return_type) && !returns {
+        if !is_unit(&function.return_type) && flow.contains(Flow::NORMAL) {
             return Err(SemanticError::MissingReturn {
                 function: function.name.clone(),
                 span: function.body.span,
@@ -266,26 +308,27 @@ impl Analyzer {
         Ok(())
     }
 
-    fn analyze_block(&mut self, block: &Block) -> Result<bool, SemanticError> {
+    fn analyze_block(&mut self, block: &Block) -> Result<Flow, SemanticError> {
         self.scopes.push(HashMap::new());
         let result = self.analyze_block_contents(block);
         self.scopes.pop();
         result
     }
 
-    fn analyze_block_contents(&mut self, block: &Block) -> Result<bool, SemanticError> {
-        let mut definitely_returns = false;
+    fn analyze_block_contents(&mut self, block: &Block) -> Result<Flow, SemanticError> {
+        let mut flow = Flow::NORMAL;
 
         for statement in &block.statements {
-            if self.analyze_statement(statement)? {
-                definitely_returns = true;
+            let statement_flow = self.analyze_statement(statement)?;
+            if flow.contains(Flow::NORMAL) {
+                flow = flow.without(Flow::NORMAL).union(statement_flow);
             }
         }
 
-        Ok(definitely_returns)
+        Ok(flow)
     }
 
-    fn analyze_statement(&mut self, statement: &Stmt) -> Result<bool, SemanticError> {
+    fn analyze_statement(&mut self, statement: &Stmt) -> Result<Flow, SemanticError> {
         match statement {
             Stmt::Variable(variable) => {
                 let ty = self.variable_type(variable)?;
@@ -297,7 +340,7 @@ impl Analyzer {
                     },
                     variable.span,
                 )?;
-                Ok(false)
+                Ok(Flow::NORMAL)
             }
 
             Stmt::Assignment { target, value, .. } => {
@@ -327,12 +370,26 @@ impl Analyzer {
 
                 let value_type = self.check_expression(value, Some(&variable.ty))?;
                 self.expect_type(&variable.ty, &value_type, value.span())?;
-                Ok(false)
+                Ok(Flow::NORMAL)
             }
 
             Stmt::Expr { expression, .. } => {
                 self.check_expression(expression, None)?;
-                Ok(false)
+                Ok(Flow::NORMAL)
+            }
+
+            Stmt::Break { span } => {
+                if self.loop_depth == 0 {
+                    return Err(SemanticError::BreakOutsideLoop { span: *span });
+                }
+                Ok(Flow::BREAK)
+            }
+
+            Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    return Err(SemanticError::ContinueOutsideLoop { span: *span });
+                }
+                Ok(Flow::CONTINUE)
             }
 
             Stmt::Return { value, span } => {
@@ -342,7 +399,7 @@ impl Analyzer {
                     .expect("return outside function")
                     .clone();
                 match (is_unit(&expected), value) {
-                    (true, None) => Ok(true),
+                    (true, None) => Ok(Flow::RETURN),
                     (true, Some(expression)) => Err(SemanticError::TypeMismatch {
                         expected: Type::Unit,
                         found: self.check_expression(expression, None)?,
@@ -356,7 +413,7 @@ impl Analyzer {
                     (false, Some(expression)) => {
                         let actual = self.check_expression(expression, Some(&expected))?;
                         self.expect_type(&expected, &actual, expression.span())?;
-                        Ok(true)
+                        Ok(Flow::RETURN)
                     }
                 }
             }
@@ -369,12 +426,35 @@ impl Analyzer {
             } => {
                 let condition_type = self.check_expression(condition, Some(&named("bool")))?;
                 self.expect_type(&named("bool"), &condition_type, condition.span())?;
-                let then_returns = self.analyze_block(then_branch)?;
-                let else_returns = match else_branch {
+                let then_flow = self.analyze_block(then_branch)?;
+                let else_flow = match else_branch {
                     Some(block) => self.analyze_block(block)?,
-                    None => false,
+                    None => Flow::NORMAL,
                 };
-                Ok(else_branch.is_some() && then_returns && else_returns)
+                Ok(then_flow.union(else_flow))
+            }
+
+            Stmt::While {
+                condition, body, ..
+            } => {
+                let condition_type = self.check_expression(condition, Some(&named("bool")))?;
+                self.expect_type(&named("bool"), &condition_type, condition.span())?;
+
+                let statically_true = matches!(condition, Expr::Bool { value: true, .. });
+                self.loop_depth += 1;
+                let body_result = self.analyze_block(body);
+                self.loop_depth -= 1;
+                let body_flow = body_result?;
+
+                let mut flow = if body_flow.contains(Flow::RETURN) {
+                    Flow::RETURN
+                } else {
+                    Flow(0)
+                };
+                if !statically_true || body_flow.contains(Flow::BREAK) {
+                    flow = flow.union(Flow::NORMAL);
+                }
+                Ok(flow)
             }
         }
     }
@@ -838,6 +918,68 @@ mod tests {
                 "f :: () -> i32 { return 1; } main :: () -> i32 { f := 2; return f(); }"
             ),
             Err(SemanticError::NotCallable { .. })
+        ));
+    }
+
+    #[test]
+    fn checks_loop_context_and_conditions() {
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { while true { break; } return 0; }"),
+            Ok(())
+        ));
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { while 1 { break; } return 0; }"),
+            Err(SemanticError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { break; return 0; }"),
+            Err(SemanticError::BreakOutsideLoop { .. })
+        ));
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { continue; return 0; }"),
+            Err(SemanticError::ContinueOutsideLoop { .. })
+        ));
+        assert!(matches!(
+            analyze_source(
+                "main :: () -> i32 { while true { if true { break; } if false { continue; } } return 0; }"
+            ),
+            Ok(())
+        ));
+    }
+
+    #[test]
+    fn loop_flow_handles_nested_loops_and_returns() {
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { while true { while true { break; } continue; } }"),
+            Ok(())
+        ));
+        assert!(matches!(
+            analyze_source("missing :: (flag: bool) -> i32 { while flag { return 1; } }"),
+            Err(SemanticError::MissingReturn { .. })
+        ));
+        assert!(matches!(
+            analyze_source("missing :: () -> i32 { while true { break; } }"),
+            Err(SemanticError::MissingReturn { .. })
+        ));
+        assert!(matches!(
+            analyze_source("spin :: () -> i32 { while true { continue; } }"),
+            Ok(())
+        ));
+        assert!(matches!(
+            analyze_source("f :: () -> i32 { while true { return 7; } }"),
+            Ok(())
+        ));
+    }
+
+    #[test]
+    fn checks_mutability_inside_loop_bodies() {
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { x := 0; while x < 1 { x = x + 1; } return x; }"),
+            Ok(())
+        ));
+        assert!(matches!(
+            analyze_source("main :: () -> i32 { x :: 0; while true { x = 1; } return x; }"),
+            Err(SemanticError::ImmutableAssignment { .. })
         ));
     }
 }

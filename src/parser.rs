@@ -241,6 +241,18 @@ impl Parser {
             return self.parse_if_statement();
         }
 
+        if self.at(TokenKind::While) {
+            return self.parse_while_statement();
+        }
+
+        if self.at(TokenKind::Break) {
+            return self.parse_loop_control_statement(true);
+        }
+
+        if self.at(TokenKind::Continue) {
+            return self.parse_loop_control_statement(false);
+        }
+
         if self.at(TokenKind::Let) || self.at(TokenKind::Var) {
             return self.parse_variable_statement();
         }
@@ -303,6 +315,30 @@ impl Parser {
             then_branch,
             else_branch,
             span: Span::new(start, end),
+        })
+    }
+
+    fn parse_while_statement(&mut self) -> Result<Stmt, ParseError> {
+        let start = self.expect(TokenKind::While)?.span.start;
+        let condition = self.parse_expression()?;
+        let body = self.parse_block()?;
+
+        Ok(Stmt::While {
+            condition,
+            span: Span::new(start, body.span.end),
+            body,
+        })
+    }
+
+    fn parse_loop_control_statement(&mut self, is_break: bool) -> Result<Stmt, ParseError> {
+        let start = self.advance().span.start;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+        let span = Span::new(start, semicolon.span.end);
+
+        Ok(if is_break {
+            Stmt::Break { span }
+        } else {
+            Stmt::Continue { span }
         })
     }
 
@@ -981,5 +1017,69 @@ mod tests {
         };
 
         assert_eq!(*operator, UnaryOp::Negate);
+    }
+
+    #[test]
+    fn parses_while_and_loop_controls_with_spans() {
+        let source = "main :: () -> i32 { while true { if true { break; } continue; } return 0; }";
+        let program = parse(source);
+        let Decl::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+
+        let Stmt::While {
+            condition,
+            body,
+            span,
+        } = &function.body.statements[0]
+        else {
+            panic!("expected while statement");
+        };
+        assert!(matches!(condition, Expr::Bool { value: true, .. }));
+        assert_eq!(span.start, source.find("while").unwrap());
+        assert_eq!(span.end, source.find("} return").unwrap() + 1);
+        assert!(matches!(body.statements[0], Stmt::If { .. }));
+
+        let Stmt::If { then_branch, .. } = &body.statements[0] else {
+            panic!("expected nested if");
+        };
+        let Stmt::Break { span } = then_branch.statements[0] else {
+            panic!("expected break");
+        };
+        assert_eq!(&source[span.start..span.end], "break;");
+
+        let Stmt::Continue { span } = body.statements[1] else {
+            panic!("expected continue");
+        };
+        assert_eq!(&source[span.start..span.end], "continue;");
+    }
+
+    #[test]
+    fn reports_missing_loop_syntax() {
+        let mut lexer = Lexer::new("main :: () -> i32 { while true return 0; }");
+        let mut tokens = Vec::new();
+        loop {
+            let token = lexer.next_token().unwrap();
+            let eof = token.kind == TokenKind::Eof;
+            tokens.push(token);
+            if eof {
+                break;
+            }
+        }
+        let error = Parser::new(tokens).parse().unwrap_err();
+        assert!(matches!(error, ParseError::UnexpectedToken { .. }));
+
+        let mut lexer = Lexer::new("main :: () -> i32 { while true { break } return 0; }");
+        let mut tokens = Vec::new();
+        loop {
+            let token = lexer.next_token().unwrap();
+            let eof = token.kind == TokenKind::Eof;
+            tokens.push(token);
+            if eof {
+                break;
+            }
+        }
+        let error = Parser::new(tokens).parse().unwrap_err();
+        assert!(matches!(error, ParseError::UnexpectedToken { .. }));
     }
 }

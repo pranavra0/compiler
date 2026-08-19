@@ -58,6 +58,20 @@ pub enum Stmt {
         span: Span,
     },
 
+    While {
+        condition: Expr,
+        body: Block,
+        span: Span,
+    },
+
+    Break {
+        span: Span,
+    },
+
+    Continue {
+        span: Span,
+    },
+
     Return {
         value: Option<Expr>,
         span: Span,

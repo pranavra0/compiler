@@ -35,6 +35,8 @@ pub enum TokenKind {
     Enum,
     Union,
     While,
+    Break,
+    Continue,
     For,
     True,
     False,
@@ -107,6 +109,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Enum => "Enum",
             TokenKind::Union => "Union",
             TokenKind::While => "While",
+            TokenKind::Break => "Break",
+            TokenKind::Continue => "Continue",
             TokenKind::For => "For",
             TokenKind::True => "True",
             TokenKind::False => "False",
@@ -596,6 +600,8 @@ fn keyword_kind(text: &str) -> Option<TokenKind> {
         "enum" => TokenKind::Enum,
         "union" => TokenKind::Union,
         "while" => TokenKind::While,
+        "break" => TokenKind::Break,
+        "continue" => TokenKind::Continue,
         "for" => TokenKind::For,
         "true" => TokenKind::True,
         "false" => TokenKind::False,
@@ -629,7 +635,7 @@ mod tests {
 
     #[test]
     fn lex_keywords_and_identifiers() {
-        let tokens = lex_all("fn main let value return");
+        let tokens = lex_all("fn main let value return while break continue");
 
         let kinds: Vec<_> = tokens.iter().map(|token| token.kind).collect();
 
@@ -641,6 +647,9 @@ mod tests {
                 TokenKind::Let,
                 TokenKind::Identifier,
                 TokenKind::Return,
+                TokenKind::While,
+                TokenKind::Break,
+                TokenKind::Continue,
                 TokenKind::Eof,
             ]
         );
