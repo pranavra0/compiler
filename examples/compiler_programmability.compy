@@ -25,10 +25,32 @@ max :: (T: type, a: T, b: T) -> T {
     return b;
 }
 
+Box :: struct(T: type) {
+    value: T;
+}
+
+box_i32 :: () -> i32 {
+    box := Box__i32{value = 7};
+    return box.value;
+}
+
+box_i64 :: () -> i64 {
+    box := Box__i64{value = 8};
+    return box.value;
+}
+
 #validate_type(Packet);
 packet_size :: #size_of(Packet);
 packet_tag_offset :: #offset_of(Packet, tag);
 computed_value :: #factorial(5);
+// Structured reflection can feed the declaration-generation API from a
+// user-defined compile-time function. The generated function is checked and
+// callable by ordinary runtime code.
+generate_packet_api :: () {
+    #generate_function("generated_packet_size", reflect_type(Packet).size);
+}
+#generate_packet_api();
+#generate_constant("packet_resource", [3]i32{8, 9, 10});
 
 use_i32 :: () -> i32 {
     a: i32 = 4;
@@ -49,8 +71,17 @@ main :: () -> i32 {
     if packet_size == 0 || packet_tag_offset != 0 {
         return 2;
     }
-    if use_i32() != 9 || use_i64() != 9 {
+    if generated_packet_size() != 8 {
         return 3;
+    }
+    if packet_resource[1] != 9 {
+        return 4;
+    }
+    if use_i32() != 9 || use_i64() != 9 {
+        return 5;
+    }
+    if box_i32() != 7 || box_i64() != 8 {
+        return 6;
     }
     return 0;
 }

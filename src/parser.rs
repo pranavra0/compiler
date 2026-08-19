@@ -434,6 +434,25 @@ impl Parser {
             });
         }
         let first = self.expect_identifier()?;
+        if self.at(TokenKind::LParen) {
+            self.advance();
+            let mut arguments = Vec::new();
+            if !self.at(TokenKind::RParen) {
+                loop {
+                    arguments.push(self.parse_type()?);
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+            let suffix = arguments
+                .iter()
+                .map(type_mangle)
+                .collect::<Vec<_>>()
+                .join("__");
+            return Ok(Type::Named(format!("{}__{}", first.lexeme, suffix)));
+        }
         if self.match_token(TokenKind::Dot) {
             let second = self.expect_identifier()?;
             Ok(Type::Named(format!("{}.{}", first.lexeme, second.lexeme)))
@@ -448,6 +467,30 @@ impl Parser {
         start: usize,
     ) -> Result<StructDecl, ParseError> {
         self.expect(TokenKind::Struct)?;
+        let mut generic_params = Vec::new();
+        if self.match_token(TokenKind::LParen) {
+            if !self.at(TokenKind::RParen) {
+                loop {
+                    let parameter = self.expect_identifier()?;
+                    self.expect(TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    if ty != Type::Named("type".into()) {
+                        return Err(ParseError::Unsupported {
+                            message: "struct generic parameters must use `: type`".into(),
+                            span: parameter.span,
+                        });
+                    }
+                    generic_params.push(GenericParam {
+                        name: parameter.lexeme,
+                        span: parameter.span,
+                    });
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+        }
         self.expect(TokenKind::LBrace)?;
         let mut fields = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -469,6 +512,7 @@ impl Parser {
         self.match_token(TokenKind::Semicolon);
         Ok(StructDecl {
             name: name.lexeme,
+            generic_params,
             fields,
             span: Span::new(start, closing.span.end),
             exported: false,
@@ -937,6 +981,14 @@ impl Parser {
                 })
             }
 
+            TokenKind::String => {
+                self.advance();
+                Ok(Expr::String {
+                    value: token.lexeme.trim_matches('"').to_string(),
+                    span: token.span,
+                })
+            }
+
             TokenKind::True | TokenKind::False => {
                 self.advance();
 
@@ -1235,6 +1287,17 @@ fn is_assignable(expression: &Expr) -> bool {
                 ..
             }
     )
+}
+
+fn type_mangle(ty: &Type) -> String {
+    match ty {
+        Type::Named(name) => name.replace('.', "_"),
+        Type::Pointer(inner) => format!("p_{}", type_mangle(inner)),
+        Type::Slice(inner) => format!("s_{}", type_mangle(inner)),
+        Type::Array { length, element } => format!("a{length}_{}", type_mangle(element)),
+        Type::Unit => "unit".into(),
+        Type::Result { .. } => "result".into(),
+    }
 }
 
 #[cfg(test)]

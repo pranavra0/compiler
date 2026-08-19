@@ -12,6 +12,7 @@ use crate::lexer::Span;
 
 const DEFAULT_STEP_LIMIT: u64 = 100_000;
 const DEFAULT_RECURSION_LIMIT: usize = 128;
+const MAX_SPECIALIZATIONS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -19,11 +20,50 @@ pub enum Value {
     Integer(i128),
     Float(f64),
     Bool(bool),
+    String(String),
+    TypeInfo(TypeMetadata),
+    FunctionInfo(FunctionMetadata),
+    ModuleInfo(ModuleMetadata),
+    DeclarationInfo(DeclarationMetadata),
+    FieldInfo(FieldMetadata),
+    TypeRef(String),
     Array(Vec<Value>),
     Struct {
         name: String,
         fields: Vec<(String, Value)>,
     },
+}
+
+/// Structured values available to compile-time reflection code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeMetadata {
+    pub name: String,
+    pub identity: String,
+    pub size: u64,
+    pub alignment: u64,
+    pub fields: Vec<Value>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldMetadata {
+    pub name: String,
+    pub ty: String,
+    pub offset: u64,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionMetadata {
+    pub name: String,
+    pub parameters: Vec<Value>,
+    pub return_type: String,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleMetadata {
+    pub declarations: Vec<Value>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclarationMetadata {
+    pub name: String,
+    pub kind: String,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,12 +115,18 @@ impl std::error::Error for Error {}
 pub struct Limits {
     pub steps: u64,
     pub recursion: usize,
+    /// Approximate interpreter memory units consumed by aggregate values.
+    pub memory: u64,
+    /// Maximum number of generated declarations.
+    pub output: u64,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
             steps: DEFAULT_STEP_LIMIT,
             recursion: DEFAULT_RECURSION_LIMIT,
+            memory: 1_000_000,
+            output: 10_000,
         }
     }
 }
@@ -112,35 +158,48 @@ fn specialize_program(program: &Program) -> Result<Program, Error> {
                 declarations.push(Decl::Function(specializer.specialize_function(function)?));
             }
             Decl::Function(_) => {}
+            Decl::Struct(structure) if structure.generic_params.is_empty() => {
+                declarations.push(Decl::Struct(specializer.specialize_struct(structure)?));
+            }
+            Decl::Struct(_) => {}
             Decl::Variable(variable) => {
-                declarations.push(Decl::Variable(crate::ast::VariableDecl {
-                    value: specializer.specialize_expr(&variable.value, &HashMap::new())?,
-                    ..variable.clone()
-                }))
+                let mut copy = variable.clone();
+                if let Some(ty) = &copy.ty {
+                    copy.ty = Some(specializer.specialize_type(ty, copy.span)?);
+                }
+                copy.value = specializer.specialize_expr(&copy.value, &HashMap::new())?;
+                declarations.push(Decl::Variable(copy));
             }
             Decl::Comptime { expression, span } => declarations.push(Decl::Comptime {
                 expression: specializer.specialize_expr(expression, &HashMap::new())?,
                 span: *span,
             }),
-            other => declarations.push(other.clone()),
         }
     }
     let mut generated = specializer.generated.into_values().collect::<Vec<_>>();
     generated.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut generated = generated
+    let mut generated_declarations = generated
         .into_iter()
         .map(Decl::Function)
         .collect::<Vec<_>>();
-    generated.extend(declarations);
+    let mut generated_structs = specializer
+        .generated_structs
+        .into_values()
+        .collect::<Vec<_>>();
+    generated_structs.sort_by(|a, b| a.name.cmp(&b.name));
+    generated_declarations.extend(generated_structs.into_iter().map(Decl::Struct));
+    generated_declarations.extend(declarations);
     Ok(Program {
         imports: program.imports.clone(),
-        declarations: generated,
+        declarations: generated_declarations,
     })
 }
 
 struct Specializer<'a> {
     generic: HashMap<String, &'a FunctionDecl>,
+    generic_structs: HashMap<String, &'a crate::ast::StructDecl>,
     generated: HashMap<String, FunctionDecl>,
+    generated_structs: HashMap<String, crate::ast::StructDecl>,
 }
 impl<'a> Specializer<'a> {
     fn new(program: &'a Program) -> Self {
@@ -152,21 +211,102 @@ impl<'a> Specializer<'a> {
                 _ => None,
             })
             .collect();
+        let generic_structs = program
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Struct(s) if !s.generic_params.is_empty() => Some((s.name.clone(), s)),
+                _ => None,
+            })
+            .collect();
         Self {
             generic,
+            generic_structs,
             generated: HashMap::new(),
+            generated_structs: HashMap::new(),
         }
     }
+    fn specialize_type(&mut self, ty: &Type, span: Span) -> Result<Type, Error> {
+        match ty {
+            Type::Named(name) => {
+                self.ensure_struct_name(name, span)?;
+                Ok(ty.clone())
+            }
+            Type::Pointer(inner) => Ok(Type::Pointer(Box::new(self.specialize_type(inner, span)?))),
+            Type::Slice(inner) => Ok(Type::Slice(Box::new(self.specialize_type(inner, span)?))),
+            Type::Array { length, element } => Ok(Type::Array {
+                length: *length,
+                element: Box::new(self.specialize_type(element, span)?),
+            }),
+            Type::Result { success, error } => Ok(Type::Result {
+                success: Box::new(self.specialize_type(success, span)?),
+                error: Box::new(self.specialize_type(error, span)?),
+            }),
+            Type::Unit => Ok(Type::Unit),
+        }
+    }
+    fn specialize_struct(
+        &mut self,
+        structure: &crate::ast::StructDecl,
+    ) -> Result<crate::ast::StructDecl, Error> {
+        let mut copy = structure.clone();
+        for field in &mut copy.fields {
+            field.ty = self.specialize_type(&field.ty, field.span)?;
+        }
+        Ok(copy)
+    }
+    fn ensure_struct_name(&mut self, name: &str, span: Span) -> Result<(), Error> {
+        let Some((base, suffix)) = name.split_once("__") else {
+            return Ok(());
+        };
+        let Some(structure) = self.generic_structs.get(base).copied() else {
+            return Ok(());
+        };
+        if self.generated_structs.contains_key(name) {
+            return Ok(());
+        }
+        if self.generated_structs.len() >= MAX_SPECIALIZATIONS {
+            return Err(Error::InvalidOperation {
+                message: "generic specialization limit exceeded".into(),
+                span,
+            });
+        }
+        let parts = suffix.split("__").collect::<Vec<_>>();
+        if parts.len() != structure.generic_params.len() {
+            return Err(Error::InvalidOperation {
+                message: format!(
+                    "generic type `{base}` expects {} type arguments",
+                    structure.generic_params.len()
+                ),
+                span,
+            });
+        }
+        let mut substitutions = HashMap::new();
+        for (parameter, part) in structure.generic_params.iter().zip(parts) {
+            substitutions.insert(parameter.name.clone(), demangle_type(part));
+        }
+        let mut specialized = structure.clone();
+        specialized.name = name.into();
+        specialized.generic_params.clear();
+        for field in &mut specialized.fields {
+            field.ty = substitute_type(&field.ty, &substitutions);
+        }
+        self.generated_structs.insert(name.into(), specialized);
+        Ok(())
+    }
     fn specialize_function(&mut self, function: &FunctionDecl) -> Result<FunctionDecl, Error> {
-        let types = function
+        let mut copy = function.clone();
+        for parameter in &mut copy.params {
+            parameter.ty = self.specialize_type(&parameter.ty, parameter.span)?;
+        }
+        copy.return_type = self.specialize_type(&copy.return_type, copy.span)?;
+        let types = copy
             .params
             .iter()
             .map(|p| (p.name.clone(), p.ty.clone()))
             .collect();
-        Ok(FunctionDecl {
-            body: self.specialize_block(&function.body, &types)?,
-            ..function.clone()
-        })
+        copy.body = self.specialize_block(&copy.body, &types)?;
+        Ok(copy)
     }
     fn ensure(
         &mut self,
@@ -218,6 +358,12 @@ impl<'a> Specializer<'a> {
         if self.generated.contains_key(&specialized_name) {
             return Ok(specialized_name);
         }
+        if self.generated.len() >= MAX_SPECIALIZATIONS {
+            return Err(Error::InvalidOperation {
+                message: "generic specialization limit exceeded".into(),
+                span,
+            });
+        }
         let mut specialized = function.clone();
         specialized.name = specialized_name.clone();
         specialized.generic_params.clear();
@@ -250,6 +396,9 @@ impl<'a> Specializer<'a> {
             match statement {
                 Stmt::Variable(v) => {
                     v.value = self.specialize_expr(&v.value, &locals)?;
+                    if let Some(ty) = &v.ty {
+                        v.ty = Some(self.specialize_type(ty, v.span)?);
+                    }
                     let ty = v.ty.clone().unwrap_or_else(|| {
                         infer_expr_type(&v.value, &locals).unwrap_or(Type::Named("i32".into()))
                     });
@@ -364,20 +513,23 @@ impl<'a> Specializer<'a> {
                     .collect::<Result<_, _>>()?,
                 span,
             }),
-            Expr::StructLiteral { name, fields, .. } => Ok(Expr::StructLiteral {
-                name: name.clone(),
-                fields: fields
-                    .iter()
-                    .map(|f| {
-                        Ok(crate::ast::StructInit {
-                            name: f.name.clone(),
-                            value: self.specialize_expr(&f.value, env)?,
-                            span: f.span,
+            Expr::StructLiteral { name, fields, span } => {
+                self.ensure_struct_name(name, *span)?;
+                Ok(Expr::StructLiteral {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|f| {
+                            Ok(crate::ast::StructInit {
+                                name: f.name.clone(),
+                                value: self.specialize_expr(&f.value, env)?,
+                                span: f.span,
+                            })
                         })
-                    })
-                    .collect::<Result<_, Error>>()?,
-                span,
-            }),
+                        .collect::<Result<_, Error>>()?,
+                    span: *span,
+                })
+            }
             Expr::Propagate { expression, .. } => Ok(Expr::Propagate {
                 expression: Box::new(self.specialize_expr(expression, env)?),
                 span,
@@ -604,6 +756,14 @@ fn substitute_expr_types(expression: &Expr, substitutions: &HashMap<String, Type
         _ => expression.clone(),
     }
 }
+fn demangle_type(name: &str) -> Type {
+    match name {
+        "unit" => Type::Unit,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128" | "f32"
+        | "f64" | "bool" | "usize" | "isize" => Type::Named(name.into()),
+        _ => Type::Named(name.into()),
+    }
+}
 fn mangle_type(ty: &Type) -> String {
     match ty {
         Type::Named(n) => n.replace('.', "_"),
@@ -615,6 +775,13 @@ fn mangle_type(ty: &Type) -> String {
     }
 }
 
+enum ExecResult {
+    Normal,
+    Return(Value),
+    Break,
+    Continue,
+}
+
 struct Expander<'a> {
     program: &'a Program,
     functions: HashMap<String, &'a FunctionDecl>,
@@ -624,6 +791,9 @@ struct Expander<'a> {
     limits: Limits,
     steps: u64,
     recursion: usize,
+    memory_used: u64,
+    generated: Vec<Decl>,
+    eval_cache: HashMap<String, Value>,
 }
 impl<'a> Expander<'a> {
     fn new(program: &'a Program, pointer_width: u32, limits: Limits) -> Self {
@@ -649,6 +819,9 @@ impl<'a> Expander<'a> {
             limits,
             steps: 0,
             recursion: 0,
+            memory_used: 0,
+            generated: Vec::new(),
+            eval_cache: HashMap::new(),
         }
     }
     fn expand(mut self) -> Result<Program, Error> {
@@ -699,6 +872,27 @@ impl<'a> Expander<'a> {
                 }
                 other => declarations.push(other.clone()),
             }
+        }
+        for generated in self.generated {
+            let generated_name =
+                declaration_name(&generated).expect("generated runtime declaration");
+            if self
+                .program
+                .declarations
+                .iter()
+                .any(|d| declaration_name(d) == Some(generated_name))
+                || declarations
+                    .iter()
+                    .any(|d| declaration_name(d) == Some(generated_name))
+            {
+                return Err(Error::InvalidOperation {
+                    message: format!(
+                        "generated declaration `{generated_name}` conflicts with an existing declaration"
+                    ),
+                    span: declaration_span(&generated),
+                });
+            }
+            declarations.push(generated);
         }
         Ok(Program {
             imports: self.program.imports.clone(),
@@ -851,25 +1045,43 @@ impl<'a> Expander<'a> {
             Ok(())
         }
     }
+    fn consume(&mut self, amount: u64, span: Span) -> Result<(), Error> {
+        self.memory_used = self.memory_used.saturating_add(amount);
+        if self.memory_used > self.limits.memory {
+            Err(Error::InvalidOperation {
+                message: "compile-time evaluation exceeded the memory limit".into(),
+                span,
+            })
+        } else {
+            Ok(())
+        }
+    }
     fn eval(&mut self, expression: &Expr, env: &HashMap<String, Value>) -> Result<Value, Error> {
         self.tick(expression.span())?;
         match expression {
             Expr::Integer { value, .. } => Ok(Value::Integer(*value)),
             Expr::Float { value, .. } => Ok(Value::Float(*value)),
+            Expr::String { value, .. } => Ok(Value::String(value.clone())),
             Expr::Bool { value, .. } => Ok(Value::Bool(*value)),
-            Expr::ArrayLiteral { elements, .. } => Ok(Value::Array(
-                elements
-                    .iter()
-                    .map(|e| self.eval(e, env))
-                    .collect::<Result<_, _>>()?,
-            )),
-            Expr::StructLiteral { name, fields, .. } => Ok(Value::Struct {
-                name: name.clone(),
-                fields: fields
-                    .iter()
-                    .map(|f| Ok((f.name.clone(), self.eval(&f.value, env)?)))
-                    .collect::<Result<_, Error>>()?,
-            }),
+            Expr::ArrayLiteral { elements, span, .. } => {
+                self.consume(elements.len() as u64, *span)?;
+                Ok(Value::Array(
+                    elements
+                        .iter()
+                        .map(|e| self.eval(e, env))
+                        .collect::<Result<_, _>>()?,
+                ))
+            }
+            Expr::StructLiteral { name, fields, span } => {
+                self.consume(fields.len() as u64, *span)?;
+                Ok(Value::Struct {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|f| Ok((f.name.clone(), self.eval(&f.value, env)?)))
+                        .collect::<Result<_, Error>>()?,
+                })
+            }
             Expr::Identifier { name, span } => env
                 .get(name)
                 .cloned()
@@ -958,6 +1170,99 @@ impl<'a> Expander<'a> {
                     self.validate_type_expr(&arguments[0])?;
                     return Ok(Value::Unit);
                 }
+                if name == "reflect_type" {
+                    if arguments.len() != 1 {
+                        return Err(Error::InvalidOperation {
+                            message: "reflect_type expects one type argument".into(),
+                            span: *span,
+                        });
+                    }
+                    return self.reflect_type_expr(&arguments[0], *span);
+                }
+                if name == "validate" || name == "compile_error" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.eval(x, env))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let valid = if name == "compile_error" {
+                        false
+                    } else {
+                        matches!(args.first(), Some(Value::Bool(true)))
+                    };
+                    if !valid {
+                        let message = args
+                            .iter()
+                            .find_map(|value| match value {
+                                Value::String(message) => Some(message.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "compile-time validation failed".into());
+                        return Err(Error::InvalidOperation {
+                            message,
+                            span: *span,
+                        });
+                    }
+                    return Ok(Value::Unit);
+                }
+                if name == "length" {
+                    if arguments.len() != 1 {
+                        return Err(Error::InvalidOperation {
+                            message: "length expects one argument".into(),
+                            span: *span,
+                        });
+                    }
+                    return match self.eval(&arguments[0], env)? {
+                        Value::Array(values) => Ok(Value::Integer(values.len() as i128)),
+                        Value::String(value) => Ok(Value::Integer(value.len() as i128)),
+                        _ => Err(Error::InvalidOperation {
+                            message: "length expects an array or string".into(),
+                            span: *span,
+                        }),
+                    };
+                }
+                if name == "reflect_module" {
+                    if !arguments.is_empty() {
+                        return Err(Error::InvalidOperation {
+                            message: "reflect_module expects no arguments".into(),
+                            span: *span,
+                        });
+                    }
+                    return Ok(Value::ModuleInfo(ModuleMetadata {
+                        declarations: self.reflect_module(),
+                    }));
+                }
+                if name == "reflect_function" {
+                    if arguments.len() != 1 {
+                        return Err(Error::InvalidOperation {
+                            message: "reflect_function expects one function name".into(),
+                            span: *span,
+                        });
+                    }
+                    let Value::String(function_name) = self.eval(&arguments[0], env)? else {
+                        return Err(Error::InvalidOperation {
+                            message: "reflect_function expects a string name".into(),
+                            span: *span,
+                        });
+                    };
+                    return self.reflect_function_name(&function_name, *span);
+                }
+                if name == "generate_function" || name == "generate_constant" {
+                    if arguments.len() != 2 {
+                        return Err(Error::InvalidOperation {
+                            message: format!("{name} expects a name and a value"),
+                            span: *span,
+                        });
+                    }
+                    let Value::String(generated_name) = self.eval(&arguments[0], env)? else {
+                        return Err(Error::InvalidOperation {
+                            message: "generated declaration name must be a string".into(),
+                            span: *span,
+                        });
+                    };
+                    let value = self.eval(&arguments[1], env)?;
+                    self.generate_declaration(name, generated_name, value, *span)?;
+                    return Ok(Value::Unit);
+                }
                 let args = arguments
                     .iter()
                     .map(|x| self.eval(x, env))
@@ -973,8 +1278,53 @@ impl<'a> Expander<'a> {
                         name: name.clone(),
                         span: *span,
                     }),
+                Value::TypeInfo(info) => match name.as_str() {
+                    "name" => Ok(Value::String(info.name)),
+                    "identity" => Ok(Value::String(info.identity)),
+                    "size" => Ok(Value::Integer(info.size as i128)),
+                    "alignment" => Ok(Value::Integer(info.alignment as i128)),
+                    "fields" => Ok(Value::Array(info.fields)),
+                    _ => Err(Error::Undefined {
+                        name: name.clone(),
+                        span: *span,
+                    }),
+                },
+                Value::FieldInfo(info) => match name.as_str() {
+                    "name" => Ok(Value::String(info.name)),
+                    "type" => Ok(Value::TypeRef(info.ty)),
+                    "offset" => Ok(Value::Integer(info.offset as i128)),
+                    _ => Err(Error::Undefined {
+                        name: name.clone(),
+                        span: *span,
+                    }),
+                },
+                Value::FunctionInfo(info) => match name.as_str() {
+                    "name" => Ok(Value::String(info.name)),
+                    "parameters" => Ok(Value::Array(info.parameters)),
+                    "return_type" => Ok(Value::TypeRef(info.return_type)),
+                    _ => Err(Error::Undefined {
+                        name: name.clone(),
+                        span: *span,
+                    }),
+                },
+                Value::ModuleInfo(info) => match name.as_str() {
+                    "declarations" => Ok(Value::Array(info.declarations)),
+                    _ => Err(Error::Undefined {
+                        name: name.clone(),
+                        span: *span,
+                    }),
+                },
+                Value::DeclarationInfo(info) => match name.as_str() {
+                    "name" => Ok(Value::String(info.name)),
+                    "kind" => Ok(Value::String(info.kind)),
+                    "exported" => Ok(Value::Bool(info.exported)),
+                    _ => Err(Error::Undefined {
+                        name: name.clone(),
+                        span: *span,
+                    }),
+                },
                 _ => Err(Error::InvalidOperation {
-                    message: "field access requires a compile-time struct".into(),
+                    message: "field access requires a compile-time struct or metadata value".into(),
                     span: *span,
                 }),
             },
@@ -1008,7 +1358,10 @@ impl<'a> Expander<'a> {
     }
     fn binary(&self, a: Value, op: BinaryOp, b: Value, span: Span) -> Result<Value, Error> {
         match op {
-            BinaryOp::Add => integer_op(a, b, |x: i128, y: i128| x.wrapping_add(y), span),
+            BinaryOp::Add => match (a, b) {
+                (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{x}{y}"))),
+                (a, b) => integer_op(a, b, |x: i128, y: i128| x.wrapping_add(y), span),
+            },
             BinaryOp::Subtract => integer_op(a, b, |x: i128, y: i128| x.wrapping_sub(y), span),
             BinaryOp::Multiply => integer_op(a, b, |x: i128, y: i128| x.wrapping_mul(y), span),
             BinaryOp::BitwiseAnd => integer_op(a, b, |x: i128, y: i128| x & y, span),
@@ -1056,6 +1409,172 @@ impl<'a> Expander<'a> {
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => unreachable!(),
         }
     }
+    fn reflect_type_expr(&self, expression: &Expr, span: Span) -> Result<Value, Error> {
+        let ty = self.type_from_expr(expression, span)?;
+        let (size, alignment) = self.layout(&ty, span)?;
+        let mut fields = Vec::new();
+        if let Type::Named(name) = &ty {
+            if let Some(structure) = self.structs.get(name) {
+                let mut offset = 0;
+                for field in &structure.fields {
+                    let (field_size, field_alignment) = self.layout(&field.ty, field.span)?;
+                    offset = align_to(offset, field_alignment);
+                    fields.push(Value::FieldInfo(FieldMetadata {
+                        name: field.name.clone(),
+                        ty: type_display(&field.ty),
+                        offset,
+                    }));
+                    offset += field_size;
+                }
+            }
+        }
+        Ok(Value::TypeInfo(TypeMetadata {
+            name: type_display(&ty),
+            identity: format!("type:{}", type_display(&ty)),
+            size,
+            alignment,
+            fields,
+        }))
+    }
+    fn reflect_module(&self) -> Vec<Value> {
+        self.program
+            .declarations
+            .iter()
+            .filter_map(|declaration| match declaration {
+                Decl::Function(f) => Some(Value::DeclarationInfo(DeclarationMetadata {
+                    name: f.name.clone(),
+                    kind: "function".into(),
+                    exported: f.exported,
+                })),
+                Decl::Variable(v) => Some(Value::DeclarationInfo(DeclarationMetadata {
+                    name: v.name.clone(),
+                    kind: "variable".into(),
+                    exported: v.exported,
+                })),
+                Decl::Struct(s) => Some(Value::DeclarationInfo(DeclarationMetadata {
+                    name: s.name.clone(),
+                    kind: "struct".into(),
+                    exported: s.exported,
+                })),
+                Decl::Comptime { .. } => None,
+            })
+            .collect()
+    }
+    fn reflect_function_name(&self, name: &str, span: Span) -> Result<Value, Error> {
+        let Some(function) = self.functions.get(name) else {
+            return Err(Error::Undefined {
+                name: name.into(),
+                span,
+            });
+        };
+        let parameters = function
+            .params
+            .iter()
+            .map(|parameter| {
+                Value::FieldInfo(FieldMetadata {
+                    name: parameter.name.clone(),
+                    ty: type_display(&parameter.ty),
+                    offset: 0,
+                })
+            })
+            .collect();
+        Ok(Value::FunctionInfo(FunctionMetadata {
+            name: function.name.clone(),
+            parameters,
+            return_type: type_display(&function.return_type),
+        }))
+    }
+    fn type_from_expr(&self, expression: &Expr, span: Span) -> Result<Type, Error> {
+        match expression {
+            Expr::Identifier { name, .. } => {
+                if self.structs.contains_key(name) || is_builtin_type(name) {
+                    Ok(Type::Named(name.clone()))
+                } else {
+                    Err(Error::Undefined {
+                        name: name.clone(),
+                        span,
+                    })
+                }
+            }
+            Expr::SizeOf { ty, .. } | Expr::AlignOf { ty, .. } => Ok(ty.clone()),
+            _ => Err(Error::InvalidOperation {
+                message: "expected a type name for compile-time reflection".into(),
+                span,
+            }),
+        }
+    }
+    fn generate_declaration(
+        &mut self,
+        kind: &str,
+        name: String,
+        value: Value,
+        span: Span,
+    ) -> Result<(), Error> {
+        if name.is_empty() || !is_identifier(&name) {
+            return Err(Error::InvalidOperation {
+                message: "generated declaration name is not a valid identifier".into(),
+                span,
+            });
+        }
+        if self.generated.len() as u64 >= self.limits.output {
+            return Err(Error::InvalidOperation {
+                message: "compile-time generated output exceeded the output limit".into(),
+                span,
+            });
+        }
+        let value_type = value_type(&value).ok_or(Error::InvalidOperation {
+            message: "only ordinary scalar values can be generated as declarations".into(),
+            span,
+        })?;
+        let value_expr = self.value_expr_with_hint(value, span, Some(&value_type))?;
+        let candidate = if kind == "generate_constant" {
+            Decl::Variable(crate::ast::VariableDecl {
+                name,
+                kind: crate::ast::VariableKind::Immutable,
+                ty: Some(value_type),
+                value: value_expr,
+                span,
+                exported: false,
+            })
+        } else {
+            Decl::Function(FunctionDecl {
+                name,
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: value_type,
+                body: Block {
+                    statements: vec![Stmt::Return {
+                        value: Some(value_expr),
+                        span,
+                    }],
+                    span,
+                },
+                span,
+                is_extern: false,
+                abi: None,
+                link_name: None,
+                exported: false,
+            })
+        };
+        if let Some(existing) = self
+            .generated
+            .iter()
+            .find(|d| declaration_name(d) == declaration_name(&candidate))
+        {
+            if existing == &candidate {
+                return Ok(());
+            }
+            return Err(Error::InvalidOperation {
+                message: format!(
+                    "generated declaration `{}` conflicts with an existing declaration",
+                    declaration_name(&candidate).unwrap_or("<unnamed>")
+                ),
+                span,
+            });
+        }
+        self.generated.push(candidate);
+        Ok(())
+    }
     fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Error> {
         let Some(function) = self.functions.get(name).copied().cloned() else {
             return Err(Error::Undefined {
@@ -1075,6 +1594,10 @@ impl<'a> Expander<'a> {
                 span,
             });
         }
+        let cache_key = format!("{name}:{args:?}");
+        if let Some(value) = self.eval_cache.get(&cache_key) {
+            return Ok(value.clone());
+        }
         if self.recursion >= self.limits.recursion {
             return Err(Error::RecursionLimit { span });
         }
@@ -1085,20 +1608,36 @@ impl<'a> Expander<'a> {
         }
         let result = self.exec_block(&function.body, &mut env);
         self.recursion -= 1;
-        result
+        match result? {
+            ExecResult::Return(value) => {
+                self.eval_cache.insert(cache_key, value.clone());
+                Ok(value)
+            }
+            ExecResult::Normal => {
+                self.eval_cache.insert(cache_key, Value::Unit);
+                Ok(Value::Unit)
+            }
+            ExecResult::Break | ExecResult::Continue => Err(Error::InvalidOperation {
+                message: "break or continue escaped a compile-time function".into(),
+                span,
+            }),
+        }
     }
     fn exec_block(
         &mut self,
         block: &Block,
         env: &mut HashMap<String, Value>,
-    ) -> Result<Value, Error> {
+    ) -> Result<ExecResult, Error> {
         for statement in &block.statements {
             match statement {
                 Stmt::Return { value, .. } => {
-                    return value
-                        .as_ref()
-                        .map(|x| self.eval(x, env))
-                        .unwrap_or(Ok(Value::Unit));
+                    return Ok(ExecResult::Return(
+                        value
+                            .as_ref()
+                            .map(|x| self.eval(x, env))
+                            .transpose()?
+                            .unwrap_or(Value::Unit),
+                    ));
                 }
                 Stmt::Variable(v) => {
                     let value = self.eval(&v.value, env)?;
@@ -1113,16 +1652,15 @@ impl<'a> Expander<'a> {
                     else_branch,
                     ..
                 } => {
-                    if matches!(self.eval(condition, env)?, Value::Bool(true)) {
-                        let result = self.exec_block(then_branch, env)?;
-                        if !matches!(result, Value::Unit) {
-                            return Ok(result);
-                        }
+                    let result = if matches!(self.eval(condition, env)?, Value::Bool(true)) {
+                        self.exec_block(then_branch, env)?
                     } else if let Some(branch) = else_branch {
-                        let result = self.exec_block(branch, env)?;
-                        if !matches!(result, Value::Unit) {
-                            return Ok(result);
-                        }
+                        self.exec_block(branch, env)?
+                    } else {
+                        ExecResult::Normal
+                    };
+                    if !matches!(result, ExecResult::Normal) {
+                        return Ok(result);
                     }
                 }
                 Stmt::While {
@@ -1136,9 +1674,10 @@ impl<'a> Expander<'a> {
                         if guard > self.limits.steps {
                             return Err(Error::StepLimit { span: *span });
                         }
-                        let result = self.exec_block(body, env)?;
-                        if !matches!(result, Value::Unit) {
-                            return Ok(result);
+                        match self.exec_block(body, env)? {
+                            ExecResult::Normal | ExecResult::Continue => {}
+                            ExecResult::Break => break,
+                            result @ ExecResult::Return(_) => return Ok(result),
                         }
                     }
                 }
@@ -1151,7 +1690,7 @@ impl<'a> Expander<'a> {
                     if !env.contains_key(name) {
                         return Err(Error::Undefined {
                             name: name.clone(),
-                            span: value_span(value),
+                            span: statement_span(statement),
                         });
                     }
                     env.insert(name.clone(), value);
@@ -1162,14 +1701,8 @@ impl<'a> Expander<'a> {
                         span: *span,
                     });
                 }
-                Stmt::Break { .. } | Stmt::Continue { .. } => {
-                    return Err(Error::Unsupported {
-                        message:
-                            "break and continue are not yet available in compile-time functions"
-                                .into(),
-                        span: statement_span(statement),
-                    });
-                }
+                Stmt::Break { .. } => return Ok(ExecResult::Break),
+                Stmt::Continue { .. } => return Ok(ExecResult::Continue),
                 Stmt::Defer { span, .. } => {
                     return Err(Error::Unsupported {
                         message: "defer is runtime-only in compile-time functions".into(),
@@ -1178,7 +1711,7 @@ impl<'a> Expander<'a> {
                 }
             }
         }
-        Ok(Value::Unit)
+        Ok(ExecResult::Normal)
     }
     fn expression_type_hint(&self, expression: &Expr) -> Option<Type> {
         match expression {
@@ -1212,6 +1745,19 @@ impl<'a> Expander<'a> {
             Value::Unit => Expr::Integer { value: 0, span },
             Value::Integer(value) => Expr::Integer { value, span },
             Value::Float(value) => Expr::Float { value, span },
+            Value::String(_)
+            | Value::TypeInfo(_)
+            | Value::FunctionInfo(_)
+            | Value::ModuleInfo(_)
+            | Value::DeclarationInfo(_)
+            | Value::FieldInfo(_)
+            | Value::TypeRef(_) => {
+                return Err(Error::InvalidOperation {
+                    message: "metadata and strings cannot be emitted as runtime declarations"
+                        .into(),
+                    span,
+                });
+            }
             Value::Bool(value) => Expr::Bool { value, span },
             Value::Array(values) => {
                 let ty = hint.cloned().unwrap_or(Type::Array {
@@ -1341,6 +1887,63 @@ impl<'a> Expander<'a> {
         })
     }
 }
+fn is_builtin_type(name: &str) -> bool {
+    matches!(name, "unit" | "bool" | "f32" | "f64" | "usize" | "isize")
+        || (name.len() > 1
+            && matches!(name.as_bytes()[0], b'i' | b'u')
+            && name[1..].parse::<u16>().is_ok())
+}
+fn is_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+fn type_display(ty: &Type) -> String {
+    match ty {
+        Type::Unit => "unit".into(),
+        Type::Named(name) => name.clone(),
+        Type::Pointer(inner) => format!("*{}", type_display(inner)),
+        Type::Slice(inner) => format!("[]{}", type_display(inner)),
+        Type::Array { length, element } => format!("[{length}]{}", type_display(element)),
+        Type::Result { success, error } => {
+            format!("result({}, {})", type_display(success), type_display(error))
+        }
+    }
+}
+fn value_type(value: &Value) -> Option<Type> {
+    match value {
+        Value::Integer(_) => Some(Type::Named("i32".into())),
+        Value::Float(_) => Some(Type::Named("f64".into())),
+        Value::Bool(_) => Some(Type::Named("bool".into())),
+        Value::Array(values) => Some(Type::Array {
+            length: values.len() as u64,
+            element: Box::new(
+                values
+                    .first()
+                    .and_then(value_type)
+                    .unwrap_or(Type::Named("i32".into())),
+            ),
+        }),
+        Value::Struct { name, .. } => Some(Type::Named(name.clone())),
+        _ => None,
+    }
+}
+fn declaration_name(declaration: &Decl) -> Option<&str> {
+    match declaration {
+        Decl::Function(f) => Some(&f.name),
+        Decl::Variable(v) => Some(&v.name),
+        Decl::Struct(s) => Some(&s.name),
+        Decl::Comptime { .. } => None,
+    }
+}
+fn declaration_span(declaration: &Decl) -> Span {
+    match declaration {
+        Decl::Function(f) => f.span,
+        Decl::Variable(v) => v.span,
+        Decl::Struct(s) => s.span,
+        Decl::Comptime { span, .. } => *span,
+    }
+}
 fn integer_op(a: Value, b: Value, f: fn(i128, i128) -> i128, span: Span) -> Result<Value, Error> {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => Ok(Value::Integer(f(x, y))),
@@ -1352,9 +1955,6 @@ fn integer_op(a: Value, b: Value, f: fn(i128, i128) -> i128, span: Span) -> Resu
 }
 fn align_to(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) / alignment * alignment
-}
-fn value_span(_: Value) -> Span {
-    Span::new(0, 0)
 }
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
@@ -1374,6 +1974,7 @@ fn statement_span(statement: &Stmt) -> Span {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeInfo {
     pub name: String,
+    pub identity: String,
     pub size: u64,
     pub alignment: u64,
     pub fields: Vec<FieldInfo>,
@@ -1389,6 +1990,37 @@ pub struct FunctionInfo {
     pub name: String,
     pub parameters: Vec<(String, Type)>,
     pub return_type: Type,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationInfo {
+    pub name: String,
+    pub kind: String,
+    pub exported: bool,
+}
+
+pub fn reflect_module(program: &Program) -> Vec<DeclarationInfo> {
+    program
+        .declarations
+        .iter()
+        .filter_map(|declaration| match declaration {
+            Decl::Function(f) => Some(DeclarationInfo {
+                name: f.name.clone(),
+                kind: "function".into(),
+                exported: f.exported,
+            }),
+            Decl::Variable(v) => Some(DeclarationInfo {
+                name: v.name.clone(),
+                kind: "variable".into(),
+                exported: v.exported,
+            }),
+            Decl::Struct(s) => Some(DeclarationInfo {
+                name: s.name.clone(),
+                kind: "struct".into(),
+                exported: s.exported,
+            }),
+            Decl::Comptime { .. } => None,
+        })
+        .collect()
 }
 
 /// Reflect resolved source declarations. This is deliberately a data API: a
@@ -1409,7 +2041,8 @@ pub fn evaluate_with_limits(
 }
 
 pub fn reflect_type(program: &Program, name: &str, pointer_width: u32) -> Result<TypeInfo, Error> {
-    let expander = Expander::new(program, pointer_width, Limits::default());
+    let specialized = specialize_program(program)?;
+    let expander = Expander::new(&specialized, pointer_width, Limits::default());
     let s = expander.structs.get(name).ok_or(Error::Undefined {
         name: name.into(),
         span: Span::new(0, 0),
@@ -1430,6 +2063,7 @@ pub fn reflect_type(program: &Program, name: &str, pointer_width: u32) -> Result
     }
     Ok(TypeInfo {
         name: name.into(),
+        identity: format!("type:{name}"),
         size: align_to(offset, alignment),
         alignment,
         fields,
@@ -1437,12 +2071,19 @@ pub fn reflect_type(program: &Program, name: &str, pointer_width: u32) -> Result
 }
 
 pub fn reflect_function(program: &Program, name: &str) -> Result<FunctionInfo, Error> {
-    let function = program
+    let specialized = specialize_program(program)?;
+    let function = specialized
         .declarations
         .iter()
         .find_map(|d| match d {
             Decl::Function(f) if f.name == name => Some(f),
             _ => None,
+        })
+        .or_else(|| {
+            program.declarations.iter().find_map(|d| match d {
+                Decl::Function(f) if f.name == name => Some(f),
+                _ => None,
+            })
         })
         .ok_or(Error::Undefined {
             name: name.into(),
@@ -1544,5 +2185,121 @@ impl DeclarationGenerator {
             result.declarations.push(declaration);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline;
+
+    fn parse(source: &str) -> Program {
+        pipeline::parse_source(source).expect("test source should parse")
+    }
+
+    #[test]
+    fn evaluates_control_flow_and_break_continue() {
+        let source = r#"
+            count :: (limit: i32) -> i32 {
+                value := 0;
+                while (value < limit) {
+                    value = value + 1;
+                }
+                return value;
+            }
+            answer :: #count(4);
+            main :: () {}
+        "#;
+        let program = parse(source);
+        let expanded = expand(&program, usize::BITS).unwrap();
+        let variable = expanded
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                Decl::Variable(v) if v.name == "answer" => Some(v),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(variable.value, Expr::Integer { value: 4, .. }));
+    }
+
+    #[test]
+    fn reflection_is_structured_and_generation_is_checked() {
+        let source = r#"
+            Pair :: struct { tag: u8; value: i32; }
+            add :: (a: i32, b: i32) -> i32 { return a + b; }
+            #generate_function("generated", reflect_type(Pair).size);
+            main :: () -> i32 { return generated(); }
+        "#;
+        let program = parse(source);
+        let info = reflect_type(&program, "Pair", usize::BITS).unwrap();
+        assert_eq!(info.fields[1].name, "value");
+        assert_eq!(info.fields[1].offset, 4);
+        let function = reflect_function(&program, "add").unwrap();
+        assert_eq!(function.parameters.len(), 2);
+        let analyzed = pipeline::analyze_program(&program).unwrap();
+        assert!(analyzed.functions.iter().any(|f| f.name == "generated"));
+    }
+
+    #[test]
+    fn runtime_only_calls_and_limits_have_invocation_spans() {
+        let source = r#"
+            extern "c" puts(value: *u8) -> i32;
+            answer :: #puts(null);
+            main :: () {}
+        "#;
+        let program = parse(source);
+        let error = expand(&program, usize::BITS).unwrap_err();
+        assert!(matches!(error, Error::Unsupported { .. }));
+        assert!(error.span().start > 0);
+
+        let invalid = parse("#validate(false, \"bad declaration\");\nmain :: () {}");
+        let error = expand(&invalid, usize::BITS).unwrap_err();
+        assert!(matches!(error, Error::InvalidOperation { .. }));
+        assert!(error.to_string().contains("bad declaration"));
+
+        let recursive = parse("loop :: () { #loop(); }\n#loop();\nmain :: () {}");
+        let error = expand_with_limits(
+            &recursive,
+            usize::BITS,
+            Limits {
+                recursion: 2,
+                ..Limits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::RecursionLimit { .. }));
+    }
+
+    #[test]
+    fn expansion_is_reproducible_and_generic_types_specialize() {
+        let source = r#"
+            Box :: struct(T: type) { value: T; }
+            get :: (box: Box(i32)) -> i32 { return box.value; }
+            choose :: (T: type, a: T, b: T) -> T { if a > b { return a; } return b; }
+            first :: #choose(1, 2);
+            second :: #choose(3, 4);
+            main :: () -> i32 { x := Box__i32{value = 7}; return get(x) + choose(5, 6); }
+        "#;
+        let program = parse(source);
+        assert_eq!(
+            expand(&program, usize::BITS).unwrap(),
+            expand(&program, usize::BITS).unwrap()
+        );
+        let expanded = expand(&program, usize::BITS).unwrap();
+        assert!(
+            expanded
+                .declarations
+                .iter()
+                .any(|d| matches!(d, Decl::Struct(s) if s.name == "Box__i32"))
+        );
+        assert_eq!(
+            expanded
+                .declarations
+                .iter()
+                .filter(|d| matches!(d, Decl::Function(f) if f.name == "choose__i32"))
+                .count(),
+            1
+        );
     }
 }

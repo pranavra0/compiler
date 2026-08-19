@@ -409,6 +409,7 @@ fn validate_expr_visibility(expr: &Expr, node: &Node) -> Result<(), ProjectError
         Expr::OffsetOf { ty, .. } => validate_type_visibility(ty, node)?,
         Expr::Integer { .. }
         | Expr::Float { .. }
+        | Expr::String { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
         | Expr::Identifier { .. } => {}
@@ -496,6 +497,7 @@ fn rewrite_decl(decl: &Decl, node: &Node) -> Decl {
     match decl {
         Decl::Struct(s) => Decl::Struct(StructDecl {
             name: prefixed(&node.prefix, &s.name),
+            generic_params: s.generic_params.clone(),
             fields: s
                 .fields
                 .iter()
@@ -739,6 +741,10 @@ fn rewrite_expr(expr: &Expr, node: &Node, bound: &HashSet<String>) -> Expr {
         },
         Expr::Float { value, .. } => Expr::Float {
             value: *value,
+            span,
+        },
+        Expr::String { value, .. } => Expr::String {
+            value: value.clone(),
             span,
         },
         Expr::Bool { value, .. } => Expr::Bool {

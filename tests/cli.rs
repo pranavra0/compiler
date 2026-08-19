@@ -20,6 +20,49 @@ fn compiler() -> Command {
 }
 
 #[test]
+fn compiler_programmability_example_builds_and_exposes_generated_output() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("compiler_programmability.compy");
+    let (_, output) = paths("programmability");
+    let build = compiler()
+        .args(["build"])
+        .arg(&example)
+        .args(["-o"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(Command::new(&output).status().unwrap().code(), Some(0));
+
+    let reflection = compiler()
+        .args(["reflect"])
+        .arg(&example)
+        .arg("Packet")
+        .output()
+        .unwrap();
+    let reflection_stdout = String::from_utf8_lossy(&reflection.stdout);
+    assert!(reflection.status.success());
+    assert!(reflection_stdout.contains("FieldInfo"));
+
+    let generated = compiler()
+        .args(["generated"])
+        .arg(&example)
+        .output()
+        .unwrap();
+    let generated_stdout = String::from_utf8_lossy(&generated.stdout);
+    assert!(generated.status.success());
+    assert!(generated_stdout.contains("generated_packet_size"));
+
+    let _ = fs::remove_file(&output);
+    let _ = fs::remove_file(output.with_extension("o"));
+}
+
+#[test]
 fn check_rejects_invalid_programs() {
     let cases = [
         "main :: () -> i32 { return missing; }",

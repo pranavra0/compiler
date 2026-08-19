@@ -48,6 +48,7 @@ fn main() {
             }
         }
         "reflect" => reflect_command(filename, &arguments[3..]),
+        "generated" => generated_command(filename, &arguments[3..]),
         "build" | "compile" => build_command(filename, &arguments[3..]),
         _ => {
             eprintln!("error: unknown command `{command}`");
@@ -61,19 +62,53 @@ fn main() {
 }
 
 fn reflect_command(filename: &str, arguments: &[String]) -> Result<(), String> {
-    if arguments.len() != 1 {
-        return Err("usage: compiler reflect <file> <type>".into());
+    if arguments.len() != 1 && arguments.len() != 2 {
+        return Err(
+            "usage: compiler reflect <file> <type> | compiler reflect <file> function <name>"
+                .into(),
+        );
     }
     let source = read_source(filename)?;
     let program = pipeline::parse_source(&source)
         .map_err(|error| frontend_error(filename, &source, error))?;
-    let info = comptime::reflect_type(&program, &arguments[0], usize::BITS).map_err(|error| {
+    if arguments.len() == 2 {
+        if arguments[0] != "function" {
+            return Err("reflect kind must be `function`".into());
+        }
+        let info = comptime::reflect_function(&program, &arguments[1]).map_err(|error| {
+            format!(
+                "comptime error: {error} at {filename}:{}",
+                SourceMap::new(&source).position(error.span().start).line
+            )
+        })?;
+        println!("{info:#?}");
+    } else {
+        let info =
+            comptime::reflect_type(&program, &arguments[0], usize::BITS).map_err(|error| {
+                format!(
+                    "comptime error: {error} at {filename}:{}",
+                    SourceMap::new(&source).position(error.span().start).line
+                )
+            })?;
+        println!("{info:#?}");
+    }
+    Ok(())
+}
+
+fn generated_command(filename: &str, arguments: &[String]) -> Result<(), String> {
+    if !arguments.is_empty() {
+        return Err("usage: compiler generated <file>".into());
+    }
+    let source = read_source(filename)?;
+    let program = pipeline::parse_source(&source)
+        .map_err(|error| frontend_error(filename, &source, error))?;
+    let expanded = comptime::expand(&program, usize::BITS).map_err(|error| {
         format!(
             "comptime error: {error} at {filename}:{}",
             SourceMap::new(&source).position(error.span().start).line
         )
     })?;
-    println!("{info:#?}");
+    println!("{expanded:#?}");
     Ok(())
 }
 
@@ -435,6 +470,8 @@ fn print_usage() {
     eprintln!("    compiler lex <file>");
     eprintln!("    compiler parse <file>");
     eprintln!("    compiler reflect <file> <type>");
+    eprintln!("    compiler reflect <file> function <name>");
+    eprintln!("    compiler generated <file>");
     eprintln!("    compiler check <file> [-I <module-root>]");
     eprintln!("    compiler ir <file> [-I <module-root>]");
     eprintln!(

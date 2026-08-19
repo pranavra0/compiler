@@ -32,6 +32,7 @@ pub enum Decl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: String,
+    pub generic_params: Vec<GenericParam>,
     pub fields: Vec<StructField>,
     pub span: Span,
     pub exported: bool,
@@ -148,6 +149,10 @@ pub enum Expr {
         value: f64,
         span: Span,
     },
+    String {
+        value: String,
+        span: Span,
+    },
     Bool {
         value: bool,
         span: Span,
@@ -237,6 +242,7 @@ impl Expr {
         match self {
             Expr::Integer { span, .. }
             | Expr::Float { span, .. }
+            | Expr::String { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Null { span }
             | Expr::SizeOf { span, .. }

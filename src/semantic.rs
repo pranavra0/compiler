@@ -647,6 +647,12 @@ impl Analyzer {
                 t
             }
             Expr::Bool { .. } => named("bool"),
+            Expr::String { span, .. } => {
+                return Err(SemanticError::InvalidOperand {
+                    message: "strings are only available in compile-time context".into(),
+                    span: *span,
+                });
+            }
             Expr::Propagate { expression, span } => {
                 let actual = self.check_expression(expression, None)?;
                 let Type::Result { success, error } = actual else {
@@ -2026,6 +2032,10 @@ impl<'a> TypedLowerer<'a> {
             Expr::Bool { value, .. } => Ok(TypedExpr::Bool {
                 value: *value,
                 ty: ResolvedType::Bool,
+                span,
+            }),
+            Expr::String { .. } => Err(SemanticError::InvalidOperand {
+                message: "strings are only available in compile-time context".into(),
                 span,
             }),
             Expr::Propagate { expression, .. } => {
