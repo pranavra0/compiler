@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::ast::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, ImportDecl, Parameter, Program, Stmt, StructDecl,
-    StructField, StructInit, Type, UnaryOp, VariableDecl, VariableKind,
+    BinaryOp, Block, Decl, Expr, FunctionDecl, GenericParam, ImportDecl, Parameter, Program, Stmt,
+    StructDecl, StructField, StructInit, Type, UnaryOp, VariableDecl, VariableKind,
 };
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -121,6 +121,14 @@ impl Parser {
         while !self.at(TokenKind::Eof) {
             if self.at(TokenKind::Import) {
                 imports.push(self.parse_import()?);
+            } else if self.at(TokenKind::Hash) {
+                let start = self.current().span.start;
+                let expression = self.parse_expression()?;
+                let end = self.expect(TokenKind::Semicolon)?.span.end;
+                declarations.push(Decl::Comptime {
+                    expression,
+                    span: Span::new(start, end),
+                });
             } else {
                 declarations.push(self.parse_declaration()?);
             }
@@ -309,6 +317,21 @@ impl Parser {
 
         self.expect(TokenKind::RParen)?;
 
+        // `T: type` is a declaration of a type parameter, not a runtime
+        // argument. Keeping it explicit makes generic intent unambiguous.
+        let mut generic_params = Vec::new();
+        params.retain(|parameter| {
+            if parameter.ty == Type::Named("type".into()) {
+                generic_params.push(GenericParam {
+                    name: parameter.name.clone(),
+                    span: parameter.span,
+                });
+                false
+            } else {
+                true
+            }
+        });
+
         let return_type = if self.match_token(TokenKind::Arrow) {
             self.parse_type()?
         } else {
@@ -327,6 +350,7 @@ impl Parser {
 
         Ok(FunctionDecl {
             name: name.lexeme.clone(),
+            generic_params,
             params,
             return_type,
             body: body.clone(),
@@ -866,6 +890,16 @@ impl Parser {
 
     fn parse_primary_expression(&mut self) -> Result<Expr, ParseError> {
         let token = self.current().clone();
+
+        if token.kind == TokenKind::Hash {
+            self.advance();
+            let expression = self.parse_unary_expression()?;
+            let span = Span::new(token.span.start, expression.span().end);
+            return Ok(Expr::Comptime {
+                expression: Box::new(expression),
+                span,
+            });
+        }
 
         match token.kind {
             TokenKind::Integer => {

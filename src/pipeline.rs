@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::ast::Program;
+use crate::comptime;
 use crate::lexer::{LexError, Lexer, Span, Token, TokenKind};
 use crate::parser::{ParseError, Parser};
 use crate::semantic::{self, SemanticError};
@@ -11,6 +12,7 @@ pub enum FrontendError {
     Lexer(LexError),
     Parser(ParseError),
     Semantic(SemanticError),
+    Comptime(comptime::Error),
 }
 
 impl FrontendError {
@@ -19,6 +21,7 @@ impl FrontendError {
             Self::Lexer(_) => "lexer",
             Self::Parser(_) => "parser",
             Self::Semantic(_) => "semantic",
+            Self::Comptime(_) => "comptime",
         }
     }
 
@@ -38,6 +41,7 @@ impl FrontendError {
                 | ParseError::Unsupported { span, .. } => *span,
             },
             Self::Semantic(error) => error.span(),
+            Self::Comptime(error) => error.span(),
         }
     }
 }
@@ -59,6 +63,7 @@ impl FrontendError {
             Self::Lexer(error) => error.to_string(),
             Self::Parser(error) => error.to_string(),
             Self::Semantic(error) => error.to_string(),
+            Self::Comptime(error) => error.to_string(),
         }
     }
 }
@@ -96,7 +101,8 @@ pub fn analyze_program_with_pointer_width(
     program: &Program,
     pointer_width: u32,
 ) -> Result<TypedProgram, FrontendError> {
-    semantic::analyze_typed_with_pointer_width(program, pointer_width)
+    let expanded = comptime::expand(program, pointer_width).map_err(FrontendError::Comptime)?;
+    semantic::analyze_typed_with_pointer_width(&expanded, pointer_width)
         .map_err(FrontendError::Semantic)
 }
 

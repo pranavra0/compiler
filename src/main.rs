@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 use compiler::codegen::CodeGenerator;
+use compiler::comptime;
 use compiler::modules;
 use compiler::pipeline::{self, FrontendError};
 use compiler::semantic;
@@ -46,6 +47,7 @@ fn main() {
                 ir_command(filename, &arguments[3..])
             }
         }
+        "reflect" => reflect_command(filename, &arguments[3..]),
         "build" | "compile" => build_command(filename, &arguments[3..]),
         _ => {
             eprintln!("error: unknown command `{command}`");
@@ -56,6 +58,23 @@ fn main() {
     if let Err(error) = result {
         exit_with_error(error);
     }
+}
+
+fn reflect_command(filename: &str, arguments: &[String]) -> Result<(), String> {
+    if arguments.len() != 1 {
+        return Err("usage: compiler reflect <file> <type>".into());
+    }
+    let source = read_source(filename)?;
+    let program = pipeline::parse_source(&source)
+        .map_err(|error| frontend_error(filename, &source, error))?;
+    let info = comptime::reflect_type(&program, &arguments[0], usize::BITS).map_err(|error| {
+        format!(
+            "comptime error: {error} at {filename}:{}",
+            SourceMap::new(&source).position(error.span().start).line
+        )
+    })?;
+    println!("{info:#?}");
+    Ok(())
 }
 
 fn read_source(filename: &str) -> Result<String, String> {
@@ -415,6 +434,7 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("    compiler lex <file>");
     eprintln!("    compiler parse <file>");
+    eprintln!("    compiler reflect <file> <type>");
     eprintln!("    compiler check <file> [-I <module-root>]");
     eprintln!("    compiler ir <file> [-I <module-root>]");
     eprintln!(

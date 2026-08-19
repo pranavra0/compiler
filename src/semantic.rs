@@ -215,10 +215,13 @@ pub fn analyze_typed_with_pointer_width(
 pub fn validate_entry_point(program: &Program) -> Result<(), SemanticError> {
     let mut main = None;
     for declaration in &program.declarations {
-        let (name, span) = match declaration {
-            Decl::Function(x) => (&x.name, x.span),
-            Decl::Variable(x) => (&x.name, x.span),
-            Decl::Struct(x) => (&x.name, x.span),
+        let Some((name, span)) = (match declaration {
+            Decl::Function(x) => Some((&x.name, x.span)),
+            Decl::Variable(x) => Some((&x.name, x.span)),
+            Decl::Struct(x) => Some((&x.name, x.span)),
+            Decl::Comptime { .. } => None,
+        }) else {
+            continue;
         };
         if name != "main" {
             continue;
@@ -418,7 +421,7 @@ impl Analyzer {
                         self.constants.insert(v.name.clone(), var);
                     }
                 }
-                Decl::Struct(_) => {}
+                Decl::Struct(_) | Decl::Comptime { .. } => {}
             }
         }
         Ok(())
@@ -611,6 +614,12 @@ impl Analyzer {
         expected: Option<&Type>,
     ) -> Result<Type, SemanticError> {
         let ty = match e {
+            Expr::Comptime { span, .. } => {
+                return Err(SemanticError::InvalidOperand {
+                    message: "compile-time marker was not expanded before semantic analysis".into(),
+                    span: *span,
+                });
+            }
             Expr::Integer { value, span } => {
                 let t = expected
                     .filter(|x| is_integer(x))
@@ -1412,6 +1421,7 @@ impl<'a> TypedLowerer<'a> {
                         constants.insert(v.name.clone(), v);
                     }
                 }
+                Decl::Comptime { .. } => {}
             }
         }
         Self {
@@ -1992,6 +2002,10 @@ impl<'a> TypedLowerer<'a> {
     ) -> Result<TypedExpr, SemanticError> {
         let span = e.span();
         match e {
+            Expr::Comptime { span, .. } => Err(SemanticError::InvalidOperand {
+                message: "compile-time marker was not expanded before lowering".into(),
+                span: *span,
+            }),
             Expr::Integer { value, .. } => Ok(TypedExpr::Integer {
                 value: *value,
                 ty: expected

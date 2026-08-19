@@ -1,0 +1,56 @@
+// Compiler programmability example: compile-time evaluation, layout queries,
+// validation, and generic function specialization all use the same language.
+//
+// `compiler reflect examples/compiler_programmability.compy Packet` prints
+// structured type metadata from the compiler API.
+
+Packet :: struct {
+    tag: u8;
+    payload: i32;
+}
+
+factorial :: (n: i32) -> i32 {
+    result := 1;
+    while n > 1 {
+        result = result * n;
+        n = n - 1;
+    }
+    return result;
+}
+
+max :: (T: type, a: T, b: T) -> T {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+#validate_type(Packet);
+packet_size :: #size_of(Packet);
+packet_tag_offset :: #offset_of(Packet, tag);
+computed_value :: #factorial(5);
+
+use_i32 :: () -> i32 {
+    a: i32 = 4;
+    b: i32 = 9;
+    return max(a, b);
+}
+
+use_i64 :: () -> i64 {
+    a: i64 = 4;
+    b: i64 = 9;
+    return max(a, b);
+}
+
+main :: () -> i32 {
+    if computed_value != 120 {
+        return 1;
+    }
+    if packet_size == 0 || packet_tag_offset != 0 {
+        return 2;
+    }
+    if use_i32() != 9 || use_i64() != 9 {
+        return 3;
+    }
+    return 0;
+}

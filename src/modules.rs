@@ -254,6 +254,7 @@ fn validate_visibility(decl: &Decl, node: &Node) -> Result<(), ProjectError> {
             check_type(&f.return_type)?;
             validate_block_visibility(&f.body, node)?;
         }
+        Decl::Comptime { expression, .. } => validate_expr_visibility(expression, node)?,
     }
     Ok(())
 }
@@ -381,6 +382,10 @@ fn validate_expr_visibility(expr: &Expr, node: &Node) -> Result<(), ProjectError
         | Expr::Propagate {
             expression: operand,
             ..
+        }
+        | Expr::Comptime {
+            expression: operand,
+            ..
         } => validate_expr_visibility(operand, node)?,
         Expr::Binary { left, right, .. } => {
             validate_expr_visibility(left, node)?;
@@ -423,10 +428,11 @@ fn local_names(node: &Node) -> HashSet<String> {
     node.program
         .declarations
         .iter()
-        .map(|d| match d {
-            Decl::Function(x) => x.name.clone(),
-            Decl::Variable(x) => x.name.clone(),
-            Decl::Struct(x) => x.name.clone(),
+        .filter_map(|d| match d {
+            Decl::Function(x) => Some(x.name.clone()),
+            Decl::Variable(x) => Some(x.name.clone()),
+            Decl::Struct(x) => Some(x.name.clone()),
+            Decl::Comptime { .. } => None,
         })
         .collect()
 }
@@ -522,6 +528,7 @@ fn rewrite_decl(decl: &Decl, node: &Node) -> Decl {
             let body = rewrite_block(&f.body, node, &mut bound);
             Decl::Function(FunctionDecl {
                 name: prefixed(&node.prefix, &f.name),
+                generic_params: f.generic_params.clone(),
                 params: f
                     .params
                     .iter()
@@ -540,6 +547,10 @@ fn rewrite_decl(decl: &Decl, node: &Node) -> Decl {
                 exported: f.exported,
             })
         }
+        Decl::Comptime { expression, span } => Decl::Comptime {
+            expression: rewrite_expr(expression, node, &HashSet::new()),
+            span: *span,
+        },
     }
 }
 
@@ -694,6 +705,10 @@ fn rewrite_expr(expr: &Expr, node: &Node, bound: &HashSet<String>) -> Expr {
             span,
         },
         Expr::Propagate { expression, .. } => Expr::Propagate {
+            expression: Box::new(rewrite_expr(expression, node, bound)),
+            span,
+        },
+        Expr::Comptime { expression, .. } => Expr::Comptime {
             expression: Box::new(rewrite_expr(expression, node, bound)),
             span,
         },

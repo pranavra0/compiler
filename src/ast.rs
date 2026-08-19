@@ -21,6 +21,12 @@ pub enum Decl {
     Function(FunctionDecl),
     Variable(VariableDecl),
     Struct(StructDecl),
+    /// A top-level explicit compile-time invocation. It is evaluated and
+    /// removed before ordinary semantic analysis/code generation.
+    Comptime {
+        expression: Expr,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +47,9 @@ pub struct StructField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDecl {
     pub name: String,
+    /// Type parameters are explicit in source as `T: type`. They are removed
+    /// from the runtime parameter list during monomorphization.
+    pub generic_params: Vec<GenericParam>,
     pub params: Vec<Parameter>,
     pub return_type: Type,
     pub body: Block,
@@ -69,6 +78,12 @@ pub enum VariableKind {
     MutableInferred,
     MutableTyped,
     Immutable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenericParam {
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +217,12 @@ pub enum Expr {
         expression: Box<Expr>,
         span: Span,
     },
+    /// Explicit compile-time evaluation. The marker is deliberately part of
+    /// the AST so it cannot be confused with an ordinary runtime call.
+    Comptime {
+        expression: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,7 +251,8 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
-            | Expr::Propagate { span, .. } => *span,
+            | Expr::Propagate { span, .. }
+            | Expr::Comptime { span, .. } => *span,
         }
     }
 }

@@ -47,6 +47,8 @@ pub enum TokenKind {
     True,
     False,
     Null,
+    /// Explicit compile-time execution marker (`#`).
+    Hash,
 
     // Arithmetic
     Plus,
@@ -128,6 +130,7 @@ impl fmt::Display for TokenKind {
             TokenKind::True => "True",
             TokenKind::False => "False",
             TokenKind::Null => "Null",
+            TokenKind::Hash => "Hash",
 
             TokenKind::Plus => "Plus",
             TokenKind::Minus => "Minus",
@@ -268,6 +271,7 @@ impl<'a> Lexer<'a> {
 
             b'=' => self.lex_equal(),
             b'!' => self.lex_bang(),
+            b'#' => self.single_character_token(TokenKind::Hash),
             b'?' => self.single_character_token(TokenKind::Question),
             b'"' => self.lex_string(),
             b'.' if self.peek_next() == Some(b'.')
