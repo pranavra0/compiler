@@ -8,6 +8,38 @@ pub enum LayoutKind {
 }
 use crate::lexer::Span;
 
+/// Stable identity for a declaration. IDs are compiler-owned; source names are
+/// retained separately for diagnostics and linker metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DefId(pub u32);
+
+/// Stable identity for a local binding within a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LocalId(pub u32);
+
+/// Reserved for interned types and generic instantiations as those phases are
+/// migrated to structured identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeId(pub u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InstantiationId(pub u32);
+
+impl DefId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+impl std::fmt::Display for DefId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "def#{}", self.0)
+    }
+}
+impl LocalId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegerWidth {
     Bits(u16),
@@ -25,7 +57,7 @@ pub enum ResolvedType {
     Float {
         bits: u16,
     },
-    Struct(String),
+    Struct(DefId),
     Array {
         length: u64,
         element: Box<ResolvedType>,
@@ -53,11 +85,45 @@ impl ResolvedType {
     }
 }
 
-pub type FunctionId = usize;
-pub type LocalId = usize;
+pub type FunctionId = DefId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefinitionKind {
+    Function,
+    Struct,
+    Global,
+    Constant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definition {
+    pub id: DefId,
+    pub name: String,
+    pub kind: DefinitionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SymbolTable {
+    pub definitions: Vec<Definition>,
+}
+
+impl SymbolTable {
+    pub fn get(&self, id: DefId) -> Option<&Definition> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.id == id)
+    }
+
+    pub fn find(&self, name: &str) -> Option<&Definition> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == name)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProgram {
+    pub symbols: SymbolTable,
     pub structs: Vec<TypedStruct>,
     pub globals: Vec<TypedGlobal>,
     pub constants: Vec<TypedConstant>,
@@ -65,6 +131,7 @@ pub struct TypedProgram {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedStruct {
+    pub id: DefId,
     pub name: String,
     pub fields: Vec<TypedField>,
     pub span: Span,
@@ -76,6 +143,7 @@ pub struct TypedField {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedGlobal {
+    pub id: DefId,
     pub name: String,
     pub ty: ResolvedType,
     pub value: TypedExpr,
@@ -83,6 +151,7 @@ pub struct TypedGlobal {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedConstant {
+    pub id: DefId,
     pub name: String,
     pub ty: ResolvedType,
     pub value: TypedExpr,
@@ -122,6 +191,7 @@ pub enum TypedPlace {
         ty: ResolvedType,
     },
     Global {
+        id: DefId,
         name: String,
         ty: ResolvedType,
     },
@@ -244,6 +314,7 @@ pub enum TypedExpr {
         span: Span,
     },
     GlobalLoad {
+        id: DefId,
         name: String,
         ty: ResolvedType,
         span: Span,

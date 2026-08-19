@@ -1,0 +1,1 @@
+main :: () -> i32 { unsigned: u8 = 255; wrapped := unsigned + 1; if wrapped != 0 { return 1; } signed: i8 = 127; if signed + 1 >= signed { return 2; } return 3; }

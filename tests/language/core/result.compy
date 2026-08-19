@@ -1,0 +1,3 @@
+fail :: () -> i32 | i32 { return return_err(7); }
+wrap :: () -> i32 | i32 { value := fail()?; return return_ok(value); }
+main :: () -> i32 { result := wrap(); if is_err(result) { return 7; } return 0; }

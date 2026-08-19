@@ -7,7 +7,7 @@ use crate::ast::{
 };
 use crate::lexer::Span;
 use crate::typed::{
-    FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedConstant,
+    DefId, FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedConstant,
     TypedExpr, TypedField, TypedFunction, TypedGlobal, TypedParameter, TypedPlace, TypedProgram,
     TypedStmt, TypedStruct,
 };
@@ -272,6 +272,12 @@ pub struct Analyzer {
     loop_depth: usize,
     pointer_width: u32,
 }
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Analyzer {
     pub fn new() -> Self {
         Self::with_pointer_width(usize::BITS)
@@ -293,10 +299,10 @@ impl Analyzer {
         self.collect_types(program)?;
         self.collect_values(program)?;
         for d in &program.declarations {
-            if let Decl::Function(f) = d {
-                if !f.is_extern {
-                    self.analyze_function(f)?
-                }
+            if let Decl::Function(f) = d
+                && !f.is_extern
+            {
+                self.analyze_function(f)?
             }
         }
         Ok(())
@@ -309,17 +315,16 @@ impl Analyzer {
 
     fn collect_types(&mut self, p: &Program) -> Result<(), SemanticError> {
         for d in &p.declarations {
-            if let Decl::Struct(s) = d {
-                if self
+            if let Decl::Struct(s) = d
+                && self
                     .structs
                     .insert(s.name.clone(), StructInfo { fields: Vec::new() })
                     .is_some()
-                {
-                    return Err(SemanticError::DuplicateName {
-                        name: s.name.clone(),
-                        span: s.span,
-                    });
-                }
+            {
+                return Err(SemanticError::DuplicateName {
+                    name: s.name.clone(),
+                    span: s.span,
+                });
             }
         }
         for d in &p.declarations {
@@ -828,15 +833,14 @@ impl Analyzer {
                 self.expect_type(&named("usize"), &it, index.span())?;
                 match bt {
                     Type::Array { length, element } => {
-                        if matches!(e, Expr::Index { .. }) {
-                            if let Some(i) = self.constant_integer(index) {
-                                if i < 0 || i as u64 >= length {
-                                    return Err(SemanticError::InvalidLiteral {
-                                        message: "array index is out of bounds".into(),
-                                        span: index.span(),
-                                    });
-                                }
-                            }
+                        if matches!(e, Expr::Index { .. })
+                            && let Some(i) = self.constant_integer(index)
+                            && (i < 0 || i as u64 >= length)
+                        {
+                            return Err(SemanticError::InvalidLiteral {
+                                message: "array index is out of bounds".into(),
+                                span: index.span(),
+                            });
                         }
                         *element
                     }
@@ -1183,15 +1187,14 @@ impl Analyzer {
                 self.expect_type(&named("usize"), &it, index.span())?;
                 match bt {
                     Type::Array { length, element } => {
-                        if matches!(e, Expr::Index { .. }) {
-                            if let Some(i) = self.constant_integer(index) {
-                                if i < 0 || i as u64 >= length {
-                                    return Err(SemanticError::InvalidLiteral {
-                                        message: "array index is out of bounds".into(),
-                                        span: index.span(),
-                                    });
-                                }
-                            }
+                        if matches!(e, Expr::Index { .. })
+                            && let Some(i) = self.constant_integer(index)
+                            && (i < 0 || i as u64 >= length)
+                        {
+                            return Err(SemanticError::InvalidLiteral {
+                                message: "array index is out of bounds".into(),
+                                span: index.span(),
+                            });
                         }
                         Ok((*element, m))
                     }
@@ -1366,8 +1369,8 @@ impl Analyzer {
                     BinaryOp::BitwiseAnd => Some(a & b),
                     BinaryOp::BitwiseOr => Some(a | b),
                     BinaryOp::BitwiseXor => Some(a ^ b),
-                    BinaryOp::ShiftLeft if b >= 0 && b < 128 => Some(a.wrapping_shl(b as u32)),
-                    BinaryOp::ShiftRight if b >= 0 && b < 128 => Some(a.wrapping_shr(b as u32)),
+                    BinaryOp::ShiftLeft if (0..128).contains(&b) => Some(a.wrapping_shl(b as u32)),
+                    BinaryOp::ShiftRight if (0..128).contains(&b) => Some(a.wrapping_shr(b as u32)),
                     _ => None,
                 }
             }
@@ -1396,11 +1399,12 @@ impl Analyzer {
 struct TypedLowerer<'a> {
     program: &'a Program,
     functions: HashMap<String, (FunctionId, &'a FunctionDecl)>,
-    structs: HashMap<String, StructDecl>,
+    structs: HashMap<String, (DefId, StructDecl)>,
     globals: HashMap<String, (Type, bool)>,
+    global_ids: HashMap<String, DefId>,
     constants: HashMap<String, &'a VariableDecl>,
     scopes: Vec<HashMap<String, (LocalId, ResolvedType)>>,
-    next_local: LocalId,
+    next_local: u32,
     current_return_type: ResolvedType,
 }
 impl<'a> TypedLowerer<'a> {
@@ -1409,13 +1413,14 @@ impl<'a> TypedLowerer<'a> {
         let mut structs = HashMap::new();
         let mut globals = HashMap::new();
         let mut constants = HashMap::new();
+        let mut global_ids = HashMap::new();
         for (i, d) in p.declarations.iter().enumerate() {
             match d {
                 Decl::Function(f) => {
-                    functions.insert(f.name.clone(), (i, f));
+                    functions.insert(f.name.clone(), (DefId(i as u32), f));
                 }
                 Decl::Struct(s) => {
-                    structs.insert(s.name.clone(), s.clone());
+                    structs.insert(s.name.clone(), (DefId(i as u32), s.clone()));
                 }
                 Decl::Variable(v) => {
                     let t =
@@ -1423,6 +1428,7 @@ impl<'a> TypedLowerer<'a> {
                             .unwrap_or_else(|| infer_ast_type_with_globals(&v.value, &globals));
                     let m = !matches!(v.kind, VariableKind::Immutable);
                     globals.insert(v.name.clone(), (t, m));
+                    global_ids.insert(v.name.clone(), DefId(i as u32));
                     if !m {
                         constants.insert(v.name.clone(), v);
                     }
@@ -1435,6 +1441,7 @@ impl<'a> TypedLowerer<'a> {
             functions,
             structs,
             globals,
+            global_ids,
             constants,
             scopes: Vec::new(),
             next_local: 0,
@@ -1443,9 +1450,15 @@ impl<'a> TypedLowerer<'a> {
     }
     fn lower(mut self) -> Result<TypedProgram, SemanticError> {
         let structs = self
-            .structs
-            .values()
-            .map(|s| TypedStruct {
+            .program
+            .declarations
+            .iter()
+            .filter_map(|declaration| match declaration {
+                Decl::Struct(s) => Some((DefId(self.declaration_index(&s.name)), s)),
+                _ => None,
+            })
+            .map(|(id, s)| TypedStruct {
+                id,
                 name: s.name.clone(),
                 fields: s
                     .fields
@@ -1467,6 +1480,7 @@ impl<'a> TypedLowerer<'a> {
                 let value = self.lower_const_expr(&v.value, Some(ty.clone()))?;
                 if matches!(v.kind, VariableKind::Immutable) {
                     constants_out.push(TypedConstant {
+                        id: DefId(self.declaration_index(&v.name)),
                         name: v.name.clone(),
                         ty,
                         value,
@@ -1474,6 +1488,7 @@ impl<'a> TypedLowerer<'a> {
                     })
                 } else {
                     globals_out.push(TypedGlobal {
+                        id: DefId(self.declaration_index(&v.name)),
                         name: v.name.clone(),
                         ty,
                         value,
@@ -1488,13 +1503,58 @@ impl<'a> TypedLowerer<'a> {
                 functions.push(self.lower_function(f)?);
             }
         }
+        let symbols = self.symbol_table();
         Ok(TypedProgram {
+            symbols,
             structs,
             globals: globals_out,
             constants: constants_out,
             functions,
         })
     }
+    fn declaration_index(&self, name: &str) -> u32 {
+        self.program
+            .declarations
+            .iter()
+            .position(|declaration| match declaration {
+                Decl::Function(f) => f.name == name,
+                Decl::Struct(s) => s.name == name,
+                Decl::Variable(v) => v.name == name,
+                Decl::Comptime { .. } => false,
+            })
+            .expect("validated declaration must have an identity") as u32
+    }
+
+    fn symbol_table(&self) -> crate::typed::SymbolTable {
+        let definitions = self
+            .program
+            .declarations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, declaration)| {
+                let (name, kind) = match declaration {
+                    Decl::Function(f) => (&f.name, crate::typed::DefinitionKind::Function),
+                    Decl::Struct(s) => (&s.name, crate::typed::DefinitionKind::Struct),
+                    Decl::Variable(v) => (
+                        &v.name,
+                        if matches!(v.kind, VariableKind::Immutable) {
+                            crate::typed::DefinitionKind::Constant
+                        } else {
+                            crate::typed::DefinitionKind::Global
+                        },
+                    ),
+                    Decl::Comptime { .. } => return None,
+                };
+                Some(crate::typed::Definition {
+                    id: DefId(index as u32),
+                    name: name.clone(),
+                    kind,
+                })
+            })
+            .collect();
+        crate::typed::SymbolTable { definitions }
+    }
+
     fn lower_const_expr(
         &mut self,
         e: &Expr,
@@ -1874,6 +1934,7 @@ impl<'a> TypedLowerer<'a> {
                     Ok(TypedPlace::Local { id, ty: t })
                 } else if let Some((t, _)) = self.globals.get(name) {
                     Ok(TypedPlace::Global {
+                        id: self.global_ids[name],
                         name: name.clone(),
                         ty: self.resolve(t),
                     })
@@ -1889,7 +1950,7 @@ impl<'a> TypedLowerer<'a> {
                 let Type::Named(s) = self.ast_type_of_place(&p) else {
                     return Err(SemanticError::InvalidAssignmentTarget { span: *span });
                 };
-                let st = self.structs.get(&s).unwrap();
+                let st = &self.structs.get(&s).unwrap().1;
                 let Some((i, f)) = st.fields.iter().enumerate().find(|(_, f)| f.name == *name)
                 else {
                     return Err(SemanticError::InvalidOperand {
@@ -1986,7 +2047,7 @@ impl<'a> TypedLowerer<'a> {
                 named(n)
             }
             ResolvedType::Float { bits } => named(if *bits == 32 { "f32" } else { "f64" }),
-            ResolvedType::Struct(n) => named(n),
+            ResolvedType::Struct(n) => named(self.struct_name(*n)),
             ResolvedType::Array { length, element } => Type::Array {
                 length: *length,
                 element: Box::new(self.ast_from_resolved(element)),
@@ -2111,6 +2172,7 @@ impl<'a> TypedLowerer<'a> {
                     let ty = self.resolve(t);
                     if *m {
                         return Ok(TypedExpr::GlobalLoad {
+                            id: self.global_ids[name],
                             name: name.clone(),
                             ty,
                             span,
@@ -2133,12 +2195,12 @@ impl<'a> TypedLowerer<'a> {
             Expr::StructLiteral { name, fields, .. } => {
                 let st = self.structs.get(name).unwrap().clone();
                 let mut out = Vec::new();
-                for f in &st.fields {
+                for f in &st.1.fields {
                     let x = fields.iter().find(|x| x.name == f.name).unwrap();
                     out.push(self.lower_expr(&x.value, Some(self.resolve(&f.ty)))?)
                 }
                 Ok(TypedExpr::StructLiteral {
-                    ty: ResolvedType::Struct(name.clone()),
+                    ty: ResolvedType::Struct(st.0),
                     fields: out,
                     span,
                 })
@@ -2339,7 +2401,7 @@ impl<'a> TypedLowerer<'a> {
                         _ => unreachable!(),
                     };
                     return Ok(TypedExpr::Call {
-                        function: usize::MAX,
+                        function: DefId(u32::MAX),
                         name: name.clone(),
                         arguments: vec![pointer, length],
                         parameter_types: vec![],
@@ -2369,13 +2431,21 @@ impl<'a> TypedLowerer<'a> {
             }
         }
     }
+    fn struct_name(&self, id: DefId) -> &str {
+        self.structs
+            .values()
+            .find(|(struct_id, _)| *struct_id == id)
+            .map(|(_, structure)| structure.name.as_str())
+            .unwrap_or("<unknown-struct>")
+    }
+
     fn new_local(
         &mut self,
         n: &str,
         t: ResolvedType,
         span: Span,
     ) -> Result<LocalId, SemanticError> {
-        let id = self.next_local;
+        let id = LocalId(self.next_local);
         self.next_local += 1;
         let s = self.scopes.last_mut().unwrap();
         if s.contains_key(n) {
@@ -2410,7 +2480,12 @@ impl<'a> TypedLowerer<'a> {
                 "f32" => ResolvedType::Float { bits: 32 },
                 "f64" => ResolvedType::Float { bits: 64 },
                 "void" => ResolvedType::Unit,
-                _ => ResolvedType::Struct(n.clone()),
+                _ => ResolvedType::Struct(
+                    self.structs
+                        .get(n)
+                        .map(|(id, _)| *id)
+                        .unwrap_or(DefId(u32::MAX)),
+                ),
             },
             Type::Array { length, element } => ResolvedType::Array {
                 length: *length,
@@ -2663,6 +2738,20 @@ mod tests {
              main :: () -> i32 { xs := [2]i32{3, 4}; xs[0] = 8; return make().x + xs[0] + limit + counter; }"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn typed_program_uses_stable_definition_ids() {
+        let typed = check(
+            "Pair :: struct { x: i32; }\nmain :: () -> i32 { p := Pair{x = 1}; return p.x; }",
+        )
+        .expect("program should type check");
+        let pair = typed.symbols.find("Pair").expect("struct symbol");
+        let main = typed.symbols.find("main").expect("function symbol");
+        assert_eq!(typed.structs[0].id, pair.id);
+        assert_eq!(typed.functions[0].id, main.id);
+        assert_ne!(pair.id, main.id);
+        assert_eq!(typed.symbols.get(pair.id).unwrap().name, "Pair");
     }
 
     #[test]

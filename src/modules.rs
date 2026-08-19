@@ -261,9 +261,8 @@ fn validate_visibility(decl: &Decl, node: &Node) -> Result<(), ProjectError> {
 fn validate_type_visibility(ty: &Type, node: &Node) -> Result<(), ProjectError> {
     match ty {
         Type::Named(name) if name.contains('.') => {
-            let mut parts = name.splitn(2, '.');
-            let alias = parts.next().unwrap();
-            let item = parts.next().unwrap();
+            let (alias, item) = name.split_once('.').unwrap();
+
             if node.aliases.contains_key(alias)
                 && !node
                     .visible_exports
@@ -338,26 +337,24 @@ fn validate_stmt_visibility(stmt: &Stmt, node: &Node) -> Result<(), ProjectError
 fn validate_expr_visibility(expr: &Expr, node: &Node) -> Result<(), ProjectError> {
     match expr {
         Expr::Field { base, name, span } => {
-            if let Expr::Identifier { name: alias, .. } = base.as_ref() {
-                if node.aliases.contains_key(alias)
-                    && !node
-                        .visible_exports
-                        .get(alias)
-                        .is_some_and(|x| x.contains(name))
-                {
-                    return Err(ProjectError {
-                        message: format!("`{alias}.{name}` is not exported by module `{alias}`"),
-                        span: *span,
-                    });
-                }
+            if let Expr::Identifier { name: alias, .. } = base.as_ref()
+                && node.aliases.contains_key(alias)
+                && !node
+                    .visible_exports
+                    .get(alias)
+                    .is_some_and(|x| x.contains(name))
+            {
+                return Err(ProjectError {
+                    message: format!("`{alias}.{name}` is not exported by module `{alias}`"),
+                    span: *span,
+                });
             }
             validate_expr_visibility(base, node)?;
         }
         Expr::StructLiteral { name, fields, span } => {
             if name.contains('.') {
-                let mut parts = name.splitn(2, '.');
-                let alias = parts.next().unwrap();
-                let item = parts.next().unwrap();
+                let (alias, item) = name.split_once('.').unwrap();
+
                 if node.aliases.contains_key(alias)
                     && !node
                         .visible_exports
@@ -461,16 +458,17 @@ fn map_type(node: &Node, ty: &Type) -> Type {
     match ty {
         Type::Named(n) if local_structs(node).contains(n) => Type::Named(prefixed(&node.prefix, n)),
         Type::Named(n) if n.contains('.') => {
-            let mut p = n.splitn(2, '.');
-            let alias = p.next().unwrap();
-            let name = p.next().unwrap();
+            let (alias, name) = n.split_once('.').unwrap();
+
             let visible = node
                 .visible_exports
                 .get(alias)
                 .map(|names| names.contains(name))
                 .unwrap_or(false);
             if !visible {
-                Type::Named(format!("__private__{alias}__{name}"))
+                // Visibility has already been checked above. Keep the source
+                // spelling here instead of manufacturing a sentinel name.
+                Type::Named(format!("{alias}.{name}"))
             } else {
                 Type::Named(prefixed(
                     node.aliases.get(alias).map(String::as_str).unwrap_or(alias),
@@ -647,20 +645,23 @@ fn rewrite_expr(expr: &Expr, node: &Node, bound: &HashSet<String>) -> Expr {
             span,
         },
         Expr::Field { base, name, .. } => {
-            if let Expr::Identifier { name: alias, .. } = base.as_ref() {
-                if let Some(prefix) = node.aliases.get(alias) {
-                    let visible = node
-                        .visible_exports
-                        .get(alias)
-                        .map(|names| names.contains(name))
-                        .unwrap_or(false);
-                    let name = if visible {
-                        prefixed(prefix, name)
-                    } else {
-                        format!("__private__{alias}__{name}")
-                    };
-                    return Expr::Identifier { name, span };
-                }
+            if let Expr::Identifier { name: alias, .. } = base.as_ref()
+                && let Some(prefix) = node.aliases.get(alias)
+            {
+                let visible = node
+                    .visible_exports
+                    .get(alias)
+                    .map(|names| names.contains(name))
+                    .unwrap_or(false);
+                let name = if visible {
+                    prefixed(prefix, name)
+                } else {
+                    // `validate_visibility` normally rejects this path.
+                    // Preserve the source identity if it is reached rather
+                    // than inventing a private-name sentinel.
+                    format!("{alias}.{name}")
+                };
+                return Expr::Identifier { name, span };
             }
             Expr::Field {
                 base: Box::new(rewrite_expr(base, node, bound)),

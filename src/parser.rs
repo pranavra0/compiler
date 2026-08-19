@@ -905,22 +905,22 @@ impl Parser {
             }
             let closing = self.expect(TokenKind::RParen)?;
             let span = Span::new(expression.span().start, closing.span.end);
-            if let Expr::Identifier { name, .. } = &expression {
-                if name == "unchecked_index" {
-                    if arguments.len() != 2 {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "two arguments".into(),
-                            found: TokenKind::RParen,
-                            span: closing.span,
-                        });
-                    }
-                    expression = Expr::UncheckedIndex {
-                        base: Box::new(arguments.remove(0)),
-                        index: Box::new(arguments.remove(0)),
-                        span,
-                    };
-                    continue;
+            if let Expr::Identifier { name, .. } = &expression
+                && name == "unchecked_index"
+            {
+                if arguments.len() != 2 {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "two arguments".into(),
+                        found: TokenKind::RParen,
+                        span: closing.span,
+                    });
                 }
+                expression = Expr::UncheckedIndex {
+                    base: Box::new(arguments.remove(0)),
+                    index: Box::new(arguments.remove(0)),
+                    span,
+                };
+                continue;
             }
             expression = Expr::Call {
                 callee: Box::new(expression),

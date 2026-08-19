@@ -1,6 +1,8 @@
 pub mod ast;
 pub mod codegen;
 pub mod comptime;
+pub mod formatter;
+pub mod interpreter;
 pub mod lexer;
 pub mod modules;
 pub mod parser;

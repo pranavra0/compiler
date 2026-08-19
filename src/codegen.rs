@@ -3,13 +3,17 @@ use crate::ast::{BinaryOp, UnaryOp};
 use crate::lexer::Span;
 use crate::semantic;
 use crate::typed::{
-    IntegerWidth, LayoutKind, ResolvedType, TypedBlock, TypedExpr, TypedFunction, TypedPlace,
-    TypedProgram, TypedStmt,
+    DefId, FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedExpr,
+    TypedFunction, TypedPlace, TypedProgram, TypedStmt,
 };
 use inkwell::AddressSpace;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::BuilderError;
 use inkwell::context::Context;
+use inkwell::debug_info::{
+    AsDIScope, DIFlags, DIFlagsConstants, DIScope, DWARFEmissionKind, DWARFSourceLanguage,
+    DebugInfoBuilder,
+};
 use inkwell::module::{Linkage, Module};
 use inkwell::targets::TargetData;
 use inkwell::types::{BasicType, BasicTypeEnum, StringRadix, StructType};
@@ -20,6 +24,14 @@ use inkwell::{FloatPredicate, IntPredicate};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
+
+#[derive(Clone)]
+struct DebugLocal<'ctx> {
+    name: String,
+    local: Local<'ctx>,
+    ty: ResolvedType,
+    span: Span,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodegenError {
@@ -92,19 +104,22 @@ pub struct CodeGenerator<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: inkwell::builder::Builder<'ctx>,
-    locals: HashMap<usize, Local<'ctx>>,
-    globals: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>, ResolvedType)>,
-    functions: HashMap<usize, FunctionValue<'ctx>>,
-    abi_functions: HashSet<usize>,
-    structs: HashMap<String, StructType<'ctx>>,
-    struct_fields: HashMap<String, HashMap<String, u32>>,
+    locals: HashMap<LocalId, Local<'ctx>>,
+    globals: HashMap<DefId, (PointerValue<'ctx>, BasicTypeEnum<'ctx>, ResolvedType)>,
+    functions: HashMap<FunctionId, FunctionValue<'ctx>>,
+    abi_functions: HashSet<FunctionId>,
+    structs: HashMap<DefId, StructType<'ctx>>,
+    struct_fields: HashMap<DefId, HashMap<String, u32>>,
     current_function: Option<FunctionValue<'ctx>>,
-    current_function_id: usize,
+    current_function_id: FunctionId,
     current_return_type: ResolvedType,
     pointer_width: u32,
     target_data: TargetData,
     loop_targets: Vec<LoopTargets<'ctx>>,
     defer_scopes: Vec<Vec<Deferred<'ctx>>>,
+    debug: Option<(String, bool, String)>,
+    debug_locals: Vec<DebugLocal<'ctx>>,
+    debug_locations: HashMap<usize, inkwell::debug_info::DILocation<'ctx>>,
 }
 impl<'ctx> CodeGenerator<'ctx> {
     pub fn new(c: &'ctx Context, n: &str) -> Self {
@@ -128,13 +143,30 @@ impl<'ctx> CodeGenerator<'ctx> {
             structs: HashMap::new(),
             struct_fields: HashMap::new(),
             current_function: None,
-            current_function_id: usize::MAX,
+            current_function_id: DefId(u32::MAX),
             current_return_type: ResolvedType::Unit,
             pointer_width,
             target_data,
             loop_targets: Vec::new(),
             defer_scopes: Vec::new(),
+            debug: None,
+            debug_locals: Vec::new(),
+            debug_locations: HashMap::new(),
         }
+    }
+    pub fn with_debug_info(mut self, filename: impl Into<String>, optimized: bool) -> Self {
+        let filename = filename.into();
+        self.debug = Some((filename.clone(), optimized, String::new()));
+        self
+    }
+    pub fn with_debug_info_source(
+        mut self,
+        filename: impl Into<String>,
+        source: impl Into<String>,
+        optimized: bool,
+    ) -> Self {
+        self.debug = Some((filename.into(), optimized, source.into()));
+        self
     }
     pub fn with_pointer_width(c: &'ctx Context, n: &str, w: u32) -> Self {
         let target_data = TargetData::create(&format!("e-p:{w}:{w}"));
@@ -151,12 +183,15 @@ impl<'ctx> CodeGenerator<'ctx> {
             structs: HashMap::new(),
             struct_fields: HashMap::new(),
             current_function: None,
-            current_function_id: usize::MAX,
+            current_function_id: DefId(u32::MAX),
             current_return_type: ResolvedType::Unit,
             pointer_width: w,
             target_data,
             loop_targets: Vec::new(),
             defer_scopes: Vec::new(),
+            debug: None,
+            debug_locals: Vec::new(),
+            debug_locations: HashMap::new(),
         }
     }
     pub fn generate(self, p: &Program) -> Result<Module<'ctx>, CodegenError> {
@@ -168,9 +203,137 @@ impl<'ctx> CodeGenerator<'ctx> {
         self.declare_structs(p)?;
         self.declare_globals(p)?;
         self.declare_functions(p)?;
-        for f in &p.functions {
-            if !f.is_extern {
-                self.generate_function(f)?
+        // Debug metadata is created at the backend boundary. The language IR
+        // remains independent of LLVM's metadata representation.
+        if let Some((filename, optimized, source)) = self.debug.clone() {
+            let path = std::path::Path::new(&filename);
+            let directory = path.parent().and_then(|p| p.to_str()).unwrap_or(".");
+            let basename = path
+                .file_name()
+                .and_then(|p| p.to_str())
+                .unwrap_or(&filename);
+            let (di, unit) = self.module.create_debug_info_builder(
+                true,
+                DWARFSourceLanguage::C,
+                basename,
+                directory,
+                "compy",
+                optimized,
+                "",
+                0,
+                "",
+                DWARFEmissionKind::Full,
+                0,
+                false,
+                false,
+                "",
+                "",
+            );
+            for f in &p.functions {
+                let subroutine =
+                    di.create_subroutine_type(unit.get_file(), None, &[], DIFlags::PUBLIC);
+                let scope = di.create_function(
+                    unit.as_debug_info_scope(),
+                    &f.name,
+                    f.link_name.as_deref(),
+                    unit.get_file(),
+                    source_line(&source, f.span),
+                    subroutine,
+                    !f.exported,
+                    true,
+                    source_line(&source, f.span),
+                    DIFlags::PUBLIC,
+                    optimized,
+                );
+                if let Some(function) = self.functions.get(&f.id) {
+                    function.set_subprogram(scope);
+                }
+                if !f.is_extern {
+                    self.debug_locations.clear();
+                    self.collect_debug_locations(
+                        &di,
+                        scope.as_debug_info_scope(),
+                        &f.body,
+                        &source,
+                    );
+                    let location = di.create_debug_location(
+                        self.context,
+                        source_line(&source, f.span),
+                        source_column(&source, f.span),
+                        scope.as_debug_info_scope(),
+                        None,
+                    );
+                    self.builder.set_current_debug_location(location);
+                    self.generate_function(f)?;
+                    // Preserve parameter names in DWARF. Values may still be
+                    // optimized away, so this is intentionally best-effort.
+                    for (index, parameter) in f.params.iter().enumerate() {
+                        if let Some(local) = self.locals.get(&parameter.id).cloned() {
+                            let bits = self.target_data.get_abi_size(&local.llvm_type) * 8;
+                            let ty = di
+                                .create_basic_type(
+                                    &format!("{:?}", parameter.ty),
+                                    bits,
+                                    0,
+                                    DIFlags::PUBLIC,
+                                )
+                                .map_err(|e| CodegenError::new(e.to_string()))?;
+                            let variable = di.create_parameter_variable(
+                                scope.as_debug_info_scope(),
+                                &parameter.name,
+                                index as u32 + 1,
+                                unit.get_file(),
+                                source_line(&source, parameter.span),
+                                ty.as_type(),
+                                true,
+                                DIFlags::PUBLIC,
+                            );
+                            let entry = self.functions[&f.id].get_first_basic_block().unwrap();
+                            if let Some(instruction) = entry.get_first_instruction() {
+                                di.insert_declare_before_instruction(
+                                    local.pointer,
+                                    Some(variable),
+                                    None,
+                                    location,
+                                    instruction,
+                                );
+                            }
+                        }
+                    }
+                    for local in &self.debug_locals {
+                        let bits = self.target_data.get_abi_size(&local.local.llvm_type) * 8;
+                        let debug_type = di
+                            .create_basic_type(&format!("{:?}", local.ty), bits, 0, DIFlags::PUBLIC)
+                            .map_err(|e| CodegenError::new(e.to_string()))?;
+                        let variable = di.create_auto_variable(
+                            scope.as_debug_info_scope(),
+                            &local.name,
+                            unit.get_file(),
+                            source_line(&source, local.span),
+                            debug_type.as_type(),
+                            true,
+                            DIFlags::PUBLIC,
+                            0,
+                        );
+                        let entry = self.functions[&f.id].get_first_basic_block().unwrap();
+                        if let Some(instruction) = entry.get_first_instruction() {
+                            di.insert_declare_before_instruction(
+                                local.local.pointer,
+                                Some(variable),
+                                None,
+                                location,
+                                instruction,
+                            );
+                        }
+                    }
+                }
+            }
+            di.finalize();
+        } else {
+            for f in &p.functions {
+                if !f.is_extern {
+                    self.generate_function(f)?;
+                }
             }
         }
         self.module
@@ -181,12 +344,12 @@ impl<'ctx> CodeGenerator<'ctx> {
     fn declare_structs(&mut self, p: &TypedProgram) -> Result<(), CodegenError> {
         for s in &p.structs {
             self.structs
-                .insert(s.name.clone(), self.context.opaque_struct_type(&s.name));
+                .insert(s.id, self.context.opaque_struct_type(&s.name));
         }
         for s in &p.structs {
-            let st = self.structs[&s.name];
+            let st = self.structs[&s.id];
             self.struct_fields.insert(
-                s.name.clone(),
+                s.id,
                 s.fields
                     .iter()
                     .enumerate()
@@ -206,18 +369,18 @@ impl<'ctx> CodeGenerator<'ctx> {
         for g in p
             .globals
             .iter()
-            .map(|g| (&g.name, &g.ty, &g.value))
-            .chain(p.constants.iter().map(|c| (&c.name, &c.ty, &c.value)))
+            .map(|g| (g.id, &g.name, &g.ty, &g.value))
+            .chain(p.constants.iter().map(|c| (c.id, &c.name, &c.ty, &c.value)))
         {
-            let ty = self.basic_type(g.1.clone())?;
-            let gv = self.module.add_global(ty, None, g.0);
-            let init = self.generate_constant(g.2)?;
+            let ty = self.basic_type(g.2.clone())?;
+            let gv = self.module.add_global(ty, None, g.1);
+            let init = self.generate_constant(g.3)?;
             gv.set_initializer(&init);
-            if p.constants.iter().any(|constant| constant.name == *g.0) {
+            if p.constants.iter().any(|constant| constant.id == g.0) {
                 gv.set_constant(true);
             }
             self.globals
-                .insert(g.0.clone(), (gv.as_pointer_value(), ty, g.1.clone()));
+                .insert(g.0, (gv.as_pointer_value(), ty, g.2.clone()));
         }
         Ok(())
     }
@@ -254,7 +417,7 @@ impl<'ctx> CodeGenerator<'ctx> {
     }
     fn abi_or_basic(
         &self,
-        function: usize,
+        function: FunctionId,
         ty: ResolvedType,
     ) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
         let basic = self.basic_type(ty.clone())?;
@@ -277,7 +440,7 @@ impl<'ctx> CodeGenerator<'ctx> {
     fn abi_pack(
         &mut self,
         value: BasicValueEnum<'ctx>,
-        function: usize,
+        function: FunctionId,
         ty: ResolvedType,
         _span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
@@ -294,7 +457,7 @@ impl<'ctx> CodeGenerator<'ctx> {
     fn abi_unpack(
         &mut self,
         value: BasicValueEnum<'ctx>,
-        function: usize,
+        function: FunctionId,
         ty: ResolvedType,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
@@ -314,12 +477,49 @@ impl<'ctx> CodeGenerator<'ctx> {
         Ok(self.builder.build_load(source, ptr, "abi.unpack")?)
     }
 
+    fn collect_debug_locations(
+        &mut self,
+        di: &DebugInfoBuilder<'ctx>,
+        scope: DIScope<'ctx>,
+        block: &TypedBlock,
+        source: &str,
+    ) {
+        for statement in &block.statements {
+            let span = s_span(statement);
+            let location = di.create_debug_location(
+                self.context,
+                source_line(source, span),
+                source_column(source, span),
+                scope,
+                None,
+            );
+            self.debug_locations.insert(span.start, location);
+            match statement {
+                TypedStmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.collect_debug_locations(di, scope, then_branch, source);
+                    if let Some(branch) = else_branch {
+                        self.collect_debug_locations(di, scope, branch, source);
+                    }
+                }
+                TypedStmt::While { body, .. } => {
+                    self.collect_debug_locations(di, scope, body, source);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn generate_function(&mut self, f: &TypedFunction) -> Result<(), CodegenError> {
         let fun = self.functions[&f.id];
         self.current_function = Some(fun);
         self.current_function_id = f.id;
         self.current_return_type = f.return_type.clone();
         self.locals.clear();
+        self.debug_locals.clear();
         self.loop_targets.clear();
         self.defer_scopes.clear();
         let entry = self.context.append_basic_block(fun, "entry");
@@ -378,6 +578,9 @@ impl<'ctx> CodeGenerator<'ctx> {
         Ok(flow)
     }
     fn generate_statement(&mut self, s: &TypedStmt) -> Result<Flow, CodegenError> {
+        if let Some(location) = self.debug_locations.get(&s_span(s).start).copied() {
+            self.builder.set_current_debug_location(location);
+        }
         match s {
             TypedStmt::Declare {
                 id,
@@ -385,6 +588,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                 ty,
                 mutable: _,
                 value,
+                span,
                 ..
             } => {
                 let lt = self.basic_type(ty.clone())?;
@@ -397,13 +601,19 @@ impl<'ctx> CodeGenerator<'ctx> {
                 }
                 let p = self.builder.build_alloca(lt, &format!("{name}.addr"))?;
                 self.builder.build_store(p, v)?;
-                self.locals.insert(
-                    *id,
-                    Local {
-                        pointer: p,
-                        llvm_type: lt,
-                    },
-                );
+                let local = Local {
+                    pointer: p,
+                    llvm_type: lt,
+                };
+                self.locals.insert(*id, local.clone());
+                if self.debug.is_some() {
+                    self.debug_locals.push(DebugLocal {
+                        name: name.clone(),
+                        local,
+                        ty: ty.clone(),
+                        span: *span,
+                    });
+                }
                 Ok(Flow::NORMAL)
             }
             TypedStmt::Store {
@@ -694,10 +904,7 @@ impl<'ctx> CodeGenerator<'ctx> {
             }
             TypedExpr::IsErr { value, .. } => {
                 let v = self.generate_expression(value)?.into_struct_value();
-                Ok(self
-                    .builder
-                    .build_extract_value(v, 0, "result.is_err")?
-                    .into())
+                Ok(self.builder.build_extract_value(v, 0, "result.is_err")?)
             }
             TypedExpr::Unwrap { value, ty, span } => {
                 let v = self.generate_expression(value)?.into_struct_value();
@@ -779,10 +986,10 @@ impl<'ctx> CodeGenerator<'ctx> {
                     .ok_or_else(|| CodegenError::at("unknown resolved local", *span))?;
                 Ok(self.builder.build_load(l.llvm_type, l.pointer, "loadtmp")?)
             }
-            TypedExpr::GlobalLoad { name, span, .. } => {
+            TypedExpr::GlobalLoad { id, span, .. } => {
                 let (g, ty, _) = self
                     .globals
-                    .get(name)
+                    .get(id)
                     .cloned()
                     .ok_or_else(|| CodegenError::at("unknown global", *span))?;
                 Ok(self.builder.build_load(ty, g, "global.load")?)
@@ -1235,7 +1442,7 @@ impl<'ctx> CodeGenerator<'ctx> {
     }
     fn generate_call(
         &mut self,
-        id: usize,
+        id: FunctionId,
         args: &[TypedExpr],
         return_type: ResolvedType,
         s: Span,
@@ -1272,9 +1479,9 @@ impl<'ctx> CodeGenerator<'ctx> {
                 .get(id)
                 .ok_or_else(|| CodegenError::at("unknown local", s))?
                 .pointer),
-            TypedPlace::Global { name, .. } => Ok(self
+            TypedPlace::Global { id, .. } => Ok(self
                 .globals
-                .get(name)
+                .get(id)
                 .ok_or_else(|| CodegenError::at("unknown global", s))?
                 .0),
             TypedPlace::Temporary { value, ty } => {
@@ -1484,7 +1691,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                 .structs
                 .get(&n)
                 .copied()
-                .ok_or_else(|| CodegenError::new(format!("unknown struct `{n}`")))?
+                .ok_or_else(|| CodegenError::new(format!("unknown struct definition {:?}", n)))?
                 .into(),
             ResolvedType::Array { length, element } => {
                 let length = u32::try_from(length).map_err(|_| {
@@ -1550,7 +1757,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     .structs
                     .get(name)
                     .ok_or_else(|| CodegenError::at("unknown struct", span))?;
-                let index = self.struct_field_index(name, field, span)?;
+                let index = self.struct_field_index(*name, field, span)?;
                 self.target_data
                     .offset_of_element(st, index)
                     .ok_or_else(|| CodegenError::at("could not compute field offset", span))?
@@ -1558,13 +1765,18 @@ impl<'ctx> CodeGenerator<'ctx> {
         };
         Ok(value)
     }
-    fn struct_field_index(&self, name: &str, field: &str, span: Span) -> Result<u32, CodegenError> {
+    fn struct_field_index(
+        &self,
+        name: DefId,
+        field: &str,
+        span: Span,
+    ) -> Result<u32, CodegenError> {
         let _st = self
             .structs
-            .get(name)
+            .get(&name)
             .ok_or_else(|| CodegenError::at("unknown struct", span))?;
         self.struct_fields
-            .get(name)
+            .get(&name)
             .and_then(|fields| fields.get(field))
             .copied()
             .ok_or_else(|| CodegenError::at(format!("unknown field `{field}`"), span))
@@ -1575,6 +1787,23 @@ fn p_length(place: &TypedPlace) -> Option<u64> {
         TypedPlace::Index { length, .. } => *length,
         _ => None,
     }
+}
+
+fn source_line(source: &str, span: Span) -> u32 {
+    source.as_bytes()[..span.start.min(source.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count() as u32
+        + 1
+}
+
+fn source_column(source: &str, span: Span) -> u32 {
+    let end = span.start.min(source.len());
+    let line_start = source.as_bytes()[..end]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    (end.saturating_sub(line_start) as u32) + 1
 }
 
 fn s_span(s: &TypedStmt) -> Span {

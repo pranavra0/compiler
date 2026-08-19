@@ -1,0 +1,7 @@
+main :: () -> i32 {
+    value := 4;
+    if value == 4 {
+        return value;
+    }
+    return 0;
+}

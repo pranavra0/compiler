@@ -5,6 +5,8 @@ use std::process::{self, Command};
 
 use compiler::codegen::CodeGenerator;
 use compiler::comptime;
+use compiler::formatter;
+use compiler::interpreter;
 use compiler::modules;
 use compiler::pipeline::{self, FrontendError};
 use compiler::semantic;
@@ -17,11 +19,22 @@ use inkwell::targets::{
 
 fn main() {
     let arguments: Vec<String> = env::args().collect();
-    if arguments.len() < 3 {
+    if arguments.len() < 2 {
         print_usage();
         process::exit(1);
     }
     let command = &arguments[1];
+    if command == "fmt" {
+        let result = fmt_command(&arguments[2..]);
+        if let Err(error) = result {
+            exit_with_error(error);
+        }
+        return;
+    }
+    if arguments.len() < 3 {
+        print_usage();
+        process::exit(1);
+    }
     let filename = &arguments[2];
 
     let result = match command.as_str() {
@@ -47,6 +60,7 @@ fn main() {
                 ir_command(filename, &arguments[3..])
             }
         }
+        "run" | "interpret" => run_command(filename, &arguments[3..]),
         "reflect" => reflect_command(filename, &arguments[3..]),
         "generated" => generated_command(filename, &arguments[3..]),
         "build" | "compile" => build_command(filename, &arguments[3..]),
@@ -114,6 +128,41 @@ fn generated_command(filename: &str, arguments: &[String]) -> Result<(), String>
 
 fn read_source(filename: &str) -> Result<String, String> {
     fs::read_to_string(filename).map_err(|error| format!("could not read `{filename}`: {error}"))
+}
+
+fn fmt_command(arguments: &[String]) -> Result<(), String> {
+    let check = arguments.iter().any(|arg| arg == "--check");
+    let files: Vec<&String> = arguments
+        .iter()
+        .filter(|arg| arg.as_str() != "--check")
+        .collect();
+    if files.is_empty() {
+        return Err("usage: compiler fmt [--check] <files...>".into());
+    }
+    for filename in files {
+        let source = read_source(filename)?;
+        let formatted = formatter::format_source(&source)?;
+        if check {
+            if formatted != source {
+                return Err(format!("{filename} is not formatted"));
+            }
+        } else {
+            fs::write(filename, formatted)
+                .map_err(|error| format!("could not write `{filename}`: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_command(filename: &str, arguments: &[String]) -> Result<(), String> {
+    let options = BuildOptions::parse(arguments)?;
+    let project = project(filename, arguments)?;
+    let pointer_width = pointer_width_for(&options)?;
+    let typed = pipeline::analyze_program_with_pointer_width(&project.program, pointer_width)
+        .map_err(|error| frontend_error(filename, &project.root_source, error))?;
+    let status = interpreter::run_with_pointer_width(&typed, pointer_width)
+        .map_err(|error| format!("interpreter error: {error}"))?;
+    process::exit(status);
 }
 
 fn diagnostic(filename: &str, source: &str, error: &FrontendError) -> String {
@@ -203,23 +252,60 @@ fn ir_command(filename: &str, arguments: &[String]) -> Result<(), String> {
             )
             .ok_or_else(|| "could not create target machine".to_string())?;
         let data = machine.get_target_data();
-        let module = CodeGenerator::with_target_data(&context, "compy", &data)
+        let generator = CodeGenerator::with_target_data(&context, "compy", &data);
+        let generator = if options.debug {
+            generator.with_debug_info_source(filename, &project.root_source, options.opt_level > 0)
+        } else {
+            generator
+        };
+        let module = generator
             .generate_typed(&typed)
             .map_err(|error| format!("error: codegen error: {error}"))?;
         module.set_triple(&triple);
         module
     } else {
-        CodeGenerator::new(&context, "compy")
-            .generate_typed(&typed)
-            .map_err(|error| format!("error: codegen error: {error}"))?
+        {
+            let generator = CodeGenerator::new(&context, "compy");
+            let generator = if options.debug {
+                generator.with_debug_info_source(
+                    filename,
+                    &project.root_source,
+                    options.opt_level > 0,
+                )
+            } else {
+                generator
+            };
+            generator
+                .generate_typed(&typed)
+                .map_err(|error| format!("error: codegen error: {error}"))?
+        }
     };
-    print!("{}", module.print_to_string().to_string());
+    let text = module.print_to_string().to_string();
+    if let Some(output) = options.output {
+        ensure_not_input(filename, &output)?;
+        create_parent_directory(&output)?;
+        fs::write(&output, text)
+            .map_err(|error| format!("could not emit IR file `{}`: {error}", output.display()))?;
+        println!("ir: {}", output.display());
+    } else {
+        print!("{text}");
+    }
     Ok(())
 }
 
 fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(arguments)?;
-    let output = if options.emit_object {
+    let output = if options.emit_ir {
+        options
+            .output
+            .clone()
+            .unwrap_or_else(|| Path::new(filename).with_extension("ll"))
+    } else if options.emit_assembly {
+        options
+            .output
+            .clone()
+            .unwrap_or_else(|| Path::new(filename).with_extension("s"))
+    } else if options.emit_object {
         options
             .output
             .clone()
@@ -235,6 +321,7 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     } else {
         output.with_extension("o")
     };
+    ensure_not_input(filename, &output)?;
     let project = project(filename, arguments)?;
     if let Some(depfile) = &options.depfile {
         write_dependency_file(depfile, &output, &project.dependencies)?;
@@ -258,7 +345,7 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
         )
         .ok_or_else(|| "could not create the native LLVM target machine".to_string())?;
     let target_data = target_machine.get_target_data();
-    if !options.emit_object {
+    if !options.emit_object && !options.emit_ir && !options.emit_assembly {
         semantic::validate_entry_point(&project.program).map_err(|error| {
             let frontend = FrontendError::Semantic(error);
             frontend_error(filename, &project.root_source, frontend)
@@ -270,11 +357,37 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     )
     .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let context = Context::create();
-    let module = CodeGenerator::with_target_data(&context, module_name(&output), &target_data)
+    let generator = CodeGenerator::with_target_data(&context, module_name(&output), &target_data);
+    let generator = if options.debug {
+        generator.with_debug_info_source(filename, &project.root_source, options.opt_level > 0)
+    } else {
+        generator
+    };
+    let module = generator
         .generate_typed(&typed)
         .map_err(|error| format!("error: code generation error: {error}"))?;
     module.set_triple(&target_triple);
     module.set_data_layout(&target_data.get_data_layout());
+    if options.emit_ir {
+        create_parent_directory(&output)?;
+        fs::write(&output, module.print_to_string().to_string())
+            .map_err(|error| format!("could not emit IR file `{}`: {error}", output.display()))?;
+        println!("ir: {}", output.display());
+        return Ok(());
+    }
+    if options.emit_assembly {
+        create_parent_directory(&output)?;
+        target_machine
+            .write_to_file(&module, FileType::Assembly, &output)
+            .map_err(|error| {
+                format!(
+                    "could not emit assembly file `{}`: {error}",
+                    output.display()
+                )
+            })?;
+        println!("assembly: {}", output.display());
+        return Ok(());
+    }
     create_parent_directory(&object)?;
     target_machine
         .write_to_file(&module, FileType::Object, &object)
@@ -285,6 +398,18 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     }
     link_native(&object, &output, &options)?;
     println!("executable: {}", output.display());
+    Ok(())
+}
+
+fn ensure_not_input(filename: &str, output: &Path) -> Result<(), String> {
+    let input = Path::new(filename);
+    let same_canonical = match (fs::canonicalize(output), fs::canonicalize(input)) {
+        (Ok(output), Ok(input)) => output == input,
+        _ => false,
+    };
+    if output == input || same_canonical {
+        return Err(format!("refusing to overwrite input source `{filename}`"));
+    }
     Ok(())
 }
 
@@ -323,6 +448,10 @@ struct BuildOptions {
     depfile: Option<PathBuf>,
     opt_level: u8,
     emit_object: bool,
+    emit_ir: bool,
+    emit_assembly: bool,
+    emit_executable: bool,
+    debug: bool,
 }
 impl BuildOptions {
     fn parse(arguments: &[String]) -> Result<Self, String> {
@@ -339,6 +468,11 @@ impl BuildOptions {
             };
             match flag {
                 "-o" | "--output" => out.output = Some(PathBuf::from(value(&mut i, flag)?)),
+                "-g" | "--debug" => out.debug = true,
+                "-O0" => out.opt_level = 0,
+                "-O1" => out.opt_level = 1,
+                "-O2" => out.opt_level = 2,
+                "-O3" => out.opt_level = 3,
                 "-I" | "--module-root" => {
                     let _ = value(&mut i, flag)?;
                 }
@@ -357,10 +491,28 @@ impl BuildOptions {
                         return Err("optimization level must be 0, 1, 2, or 3".into());
                     }
                 }
-                "--emit-object" | "--object-only" => out.emit_object = true,
+                "--emit-object" | "--emit-obj" | "--object-only" => out.emit_object = true,
+                "--emit-ir" => out.emit_ir = true,
+                "--emit-asm" => out.emit_assembly = true,
+                "--emit-exe" => out.emit_executable = true,
                 other => return Err(format!("unknown build argument `{other}`")),
             }
             i += 1;
+        }
+        let artifact_count = [
+            out.emit_ir,
+            out.emit_assembly,
+            out.emit_object,
+            out.emit_executable,
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+        if artifact_count > 1 {
+            return Err("artifact emission options are mutually exclusive".into());
+        }
+        if out.emit_object && out.emit_executable {
+            return Err("artifact options --emit-obj and --emit-exe are mutually exclusive".into());
         }
         Ok(out)
     }
@@ -472,10 +624,12 @@ fn print_usage() {
     eprintln!("    compiler reflect <file> <type>");
     eprintln!("    compiler reflect <file> function <name>");
     eprintln!("    compiler generated <file>");
+    eprintln!("    compiler fmt [--check] <files...>");
+    eprintln!("    compiler run <file> [--target <triple>]");
     eprintln!("    compiler check <file> [-I <module-root>]");
     eprintln!("    compiler ir <file> [-I <module-root>]");
     eprintln!(
-        "    compiler build <file> [-o <executable>] [-I <module-root>] [-L <path>] [-l <library>] [--object <file>] [--target <triple>] [--linker <path>] [--link-arg <arg>] [-O <level>] [--depfile <path>] [--emit-object]"
+        "    compiler build <file> [-o <path>] [-I <module-root>] [-L <path>] [-l <library>] [--object <file>] [--target <triple>] [--linker <path>] [--link-arg <arg>] [-O0|-O1|-O2|-O3] [-g] [--emit-ir|--emit-asm|--emit-obj|--emit-exe] [--depfile <path>]"
     );
     eprintln!("    compiler compile <file> [-o <executable>]");
 }

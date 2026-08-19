@@ -457,14 +457,13 @@ impl<'a> Specializer<'a> {
                     name,
                     span: callee_span,
                 } = &callee
+                    && self.generic.contains_key(name)
                 {
-                    if self.generic.contains_key(name) {
-                        let specialized = self.ensure(name, &arguments, *callee_span, env)?;
-                        callee = Expr::Identifier {
-                            name: specialized,
-                            span: *callee_span,
-                        };
-                    }
+                    let specialized = self.ensure(name, &arguments, *callee_span, env)?;
+                    callee = Expr::Identifier {
+                        name: specialized,
+                        span: *callee_span,
+                    };
                 }
                 Ok(Expr::Call {
                     callee: Box::new(callee),
@@ -560,20 +559,20 @@ fn infer_generic(
     params: &[crate::ast::GenericParam],
     span: Span,
 ) -> Result<(), Error> {
-    if let Type::Named(name) = pattern {
-        if params.iter().any(|p| p.name == *name) {
-            if let Some(old) = substitutions.get(name) {
-                if old != actual {
-                    return Err(Error::InvalidOperation {
-                        message: "conflicting inferred generic type arguments".into(),
-                        span,
-                    });
-                }
-            } else {
-                substitutions.insert(name.clone(), actual.clone());
+    if let Type::Named(name) = pattern
+        && params.iter().any(|p| p.name == *name)
+    {
+        if let Some(old) = substitutions.get(name) {
+            if old != actual {
+                return Err(Error::InvalidOperation {
+                    message: "conflicting inferred generic type arguments".into(),
+                    span,
+                });
             }
-            return Ok(());
+        } else {
+            substitutions.insert(name.clone(), actual.clone());
         }
+        return Ok(());
     }
     match (pattern, actual) {
         (Type::Pointer(p), Type::Pointer(a)) | (Type::Slice(p), Type::Slice(a)) => {
@@ -857,7 +856,7 @@ impl<'a> Expander<'a> {
                 }
                 Decl::Comptime { expression, span } => {
                     // A directive is intentionally not retained in runtime IR.
-                    let value = self.eval(expression, &HashMap::new()).map_err(|e| e)?;
+                    let value = self.eval(expression, &HashMap::new())?;
                     if !matches!(value, Value::Unit) {
                         return Err(Error::InvalidOperation {
                             message: "top-level compile-time directive must return unit".into(),
@@ -1413,19 +1412,19 @@ impl<'a> Expander<'a> {
         let ty = self.type_from_expr(expression, span)?;
         let (size, alignment) = self.layout(&ty, span)?;
         let mut fields = Vec::new();
-        if let Type::Named(name) = &ty {
-            if let Some(structure) = self.structs.get(name) {
-                let mut offset = 0;
-                for field in &structure.fields {
-                    let (field_size, field_alignment) = self.layout(&field.ty, field.span)?;
-                    offset = align_to(offset, field_alignment);
-                    fields.push(Value::FieldInfo(FieldMetadata {
-                        name: field.name.clone(),
-                        ty: type_display(&field.ty),
-                        offset,
-                    }));
-                    offset += field_size;
-                }
+        if let Type::Named(name) = &ty
+            && let Some(structure) = self.structs.get(name)
+        {
+            let mut offset = 0;
+            for field in &structure.fields {
+                let (field_size, field_alignment) = self.layout(&field.ty, field.span)?;
+                offset = align_to(offset, field_alignment);
+                fields.push(Value::FieldInfo(FieldMetadata {
+                    name: field.name.clone(),
+                    ty: type_display(&field.ty),
+                    offset,
+                }));
+                offset += field_size;
             }
         }
         Ok(Value::TypeInfo(TypeMetadata {
@@ -1954,7 +1953,7 @@ fn integer_op(a: Value, b: Value, f: fn(i128, i128) -> i128, span: Span) -> Resu
     }
 }
 fn align_to(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) / alignment * alignment
+    value.div_ceil(alignment) * alignment
 }
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
@@ -2127,20 +2126,20 @@ impl DeclarationGenerator {
                 });
             }
         };
-        if let Some((name, span)) = name {
-            if self.declarations.iter().any(|d| match d {
+        if let Some((name, span)) = name
+            && self.declarations.iter().any(|d| match d {
                 Decl::Function(f) => f.name == *name,
                 Decl::Variable(v) => v.name == *name,
                 Decl::Struct(s) => s.name == *name,
                 Decl::Comptime { .. } => false,
-            }) {
-                return Err(Error::InvalidOperation {
-                    message: format!(
-                        "generated declaration `{name}` conflicts with an existing declaration"
-                    ),
-                    span,
-                });
-            }
+            })
+        {
+            return Err(Error::InvalidOperation {
+                message: format!(
+                    "generated declaration `{name}` conflicts with an existing declaration"
+                ),
+                span,
+            });
         }
         self.declarations.push(declaration);
         Ok(())
