@@ -1,0 +1,199 @@
+// The palette, dimensions, and iteration budget are calculated before the
+// runtime program exists.  The compiler then reflects on the render config,
+// validates its layout, and materializes the palette as an ordinary global.
+// cargo run -- build examples/mandelbrot.compy -O2 -o mandelbrot
+extern "c" putchar (value: i32) -> i32;
+RenderConfig :: struct {
+    width: i32;
+    height: i32;
+    max_iterations: i32;
+}
+
+
+iteration_budget :: () -> i32 {
+    budget := 0;
+    step := 1;
+    while step <= 6 {
+        budget = budget + step * 8;
+        step = step + 1;
+    }
+    return budget;
+}
+palette_glyph :: (index: i32) -> i32 {
+    // A hand-tuned ramp so it can become a typed array.
+    if index == 0 {
+        return 32;
+    }
+    if index == 1 {
+        return 46;
+    }
+    if index == 2 {
+        return 39;
+    }
+    if index == 3 {
+        return 58;
+    }
+    if index == 4 {
+        return 45;
+    }
+    if index == 5 {
+        return 61;
+    }
+    if index == 6 {
+        return 43;
+    }
+    if index == 7 {
+        return 42;
+    }
+    if index == 8 {
+        return 35;
+    }
+    if index == 9 {
+        return 37;
+    }
+    if index == 10 {
+        return 64;
+    }
+    if index == 11 {
+        return 79;
+    }
+    if index == 12 {
+        return 48;
+    }
+    if index == 13 {
+        return 88;
+    }
+    if index == 14 {
+        return 77;
+    }
+    return 32;
+}
+make_palette :: () -> [16] i32 {
+    return[16] i32 {
+        palette_glyph (0), palette_glyph (1), palette_glyph (2), palette_glyph (3), palette_glyph (4), palette_glyph (5), palette_glyph (6), palette_glyph (7), palette_glyph (8), palette_glyph (9), palette_glyph (10), palette_glyph (11), palette_glyph (12), palette_glyph (13), palette_glyph (14), palette_glyph (15)
+    };
+}
+
+// Compile-time facts and checks. These declarations become plain constants.
+frame_width :: # (80 + 20);
+frame_height :: # (36 + 8);
+budget_display :: # iteration_budget ();
+max_iterations: usize = # budget_display;
+palette_count: usize = # length (make_palette ());
+config_size :: # reflect_type (RenderConfig).size;
+config_alignment :: # reflect_type (RenderConfig).alignment;
+# validate_type (RenderConfig);
+# validate (config_size == 12, "RenderConfig layout changed: expected 12 bytes");
+# validate (config_alignment == 4, "RenderConfig alignment changed: expected 4 bytes");
+# validate (palette_count == 16, "palette must contain exactly 16 glyphs");
+// This directive runs make_palette during compilation and emits `palette` as
+// a normal [16]i32 global used by the hot rendering loop.
+# generate_constant ("palette", make_palette ());
+// Compile-time text generation works too: this becomes a [32]i32 global.
+make_banner :: () -> [32] i32 {
+    return[32] i32 {
+        67, 79, 77, 80, 89, 32, 45, 45, 32, 99, 111, 109, 112, 116, 105, 109,
+        101, 32, 77, 97, 110, 100, 101, 108, 98, 114, 111, 116, 32, 45, 45, 10
+    };
+}
+# generate_constant ("banner", make_banner ());
+put_text :: (text: [32] i32, length: usize) -> i32 {
+    index: usize = 0;
+    while index < length {
+        putchar (text[index]);
+        index = index + 1;
+    }
+    return 0;
+}
+pixel :: (cx: f64, cy: f64) -> i32 {
+    zx := 0.0;
+    zy := 0.0;
+    iterations: usize = 0;
+    while zx * zx + zy * zy <= 4.0 && iterations < max_iterations {
+        next_zx := zx * zx - zy * zy + cx;
+        zy = 2.0 * zx * zy + cy;
+        zx = next_zx;
+        iterations = iterations + 1;
+    }
+
+    // Make the boundary glow instead of using a few blunt thresholds.
+    if iterations == max_iterations {
+        return palette[palette_count - 1];
+    }
+    shade := iterations % (palette_count - 1);
+    return palette[shade + 1];
+}
+main :: () -> i32 {
+    // A little ANSI header makes repeated runs feel like a tiny demo scene.
+    putchar (27);
+    putchar (91);
+    putchar (50);
+    putchar (74);
+    putchar (27);
+    putchar (91);
+    putchar (72);
+    put_text (banner, 32);
+    y := - 1.1;
+    row := 0;
+    while row < frame_height {
+        x := - 2.4;
+        column := 0;
+        while column < frame_width {
+            putchar (pixel (x, y));
+            x = x + 0.048;
+            column = column + 1;
+        }
+        putchar (10);
+        y = y + 0.05;
+        row = row + 1;
+    }
+
+    // Footer: all of these values were decided by compile-time evaluation.
+    putchar (10);
+    putchar (91);
+    putchar (119);
+    putchar (105);
+    putchar (100);
+    putchar (116);
+    putchar (104);
+    putchar (32);
+    putchar (61);
+    putchar (32);
+    putchar (48 + frame_width / 100);
+    putchar (48 + frame_width / 10 % 10);
+    putchar (48 + frame_width % 10);
+    putchar (44);
+    putchar (32);
+    putchar (104);
+    putchar (101);
+    putchar (105);
+    putchar (103);
+    putchar (104);
+    putchar (116);
+    putchar (32);
+    putchar (61);
+    putchar (32);
+    putchar (48 + frame_height / 10);
+    putchar (48 + frame_height % 10);
+    putchar (44);
+    putchar (32);
+    putchar (105);
+    putchar (116);
+    putchar (101);
+    putchar (114);
+    putchar (97);
+    putchar (116);
+    putchar (105);
+    putchar (111);
+    putchar (110);
+    putchar (115);
+    putchar (32);
+    putchar (61);
+    putchar (32);
+    putchar (48 + budget_display / 100);
+    putchar (48 + budget_display / 10 % 10);
+    putchar (48 + budget_display % 10);
+    putchar (93);
+    putchar (10);
+    return 0;
+}
