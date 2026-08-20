@@ -132,6 +132,10 @@ impl Default for Limits {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Specialization
+// ---------------------------------------------------------------------------
+
 /// Evaluate and expand all explicit `#` expressions in a program. Ordinary
 /// expressions are never executed by this pass.
 pub fn expand(program: &Program, pointer_width: u32) -> Result<Program, Error> {
@@ -177,13 +181,6 @@ fn specialize_program(program: &Program) -> Result<Program, Error> {
             }),
         }
     }
-    // Drain structural work only after the source walk has registered all
-    // dependencies. The queue is the expansion boundary; linker spellings
-    // are still derived below solely for the compatibility AST.
-    let _completed_instantiations = specializer
-        .instantiations
-        .drain_pending()
-        .collect::<Vec<_>>();
     let mut generated = specializer.generated.into_values().collect::<Vec<_>>();
     generated.sort_by(|a, b| a.name.cmp(&b.name));
     let mut generated_declarations = generated
@@ -302,7 +299,7 @@ impl<'a> Specializer<'a> {
             .filter_map(|parameter| substitutions.get(&parameter.name))
             .map(|ty| self.type_id(ty))
             .collect();
-        let (_, fresh) = self.instantiations.intern(InstantiationKey {
+        let fresh = self.instantiations.intern(InstantiationKey {
             definition,
             type_arguments,
             value_arguments: Vec::new(),
@@ -2092,6 +2089,10 @@ pub struct DeclarationInfo {
     pub exported: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Reflection
+// ---------------------------------------------------------------------------
+
 pub fn reflect_module(program: &Program) -> Vec<DeclarationInfo> {
     program
         .declarations
@@ -2117,8 +2118,10 @@ pub fn reflect_module(program: &Program) -> Vec<DeclarationInfo> {
         .collect()
 }
 
-/// Reflect resolved source declarations. This is deliberately a data API: a
-/// caller never has to parse formatted compiler output.
+// ---------------------------------------------------------------------------
+// Typed constant evaluation
+// ---------------------------------------------------------------------------
+
 /// Evaluate an already-resolved pure expression through the same typed
 /// evaluator used by constant-folding clients. Syntax evaluation remains
 /// available below for declaration generation, where an AST value is needed.
@@ -2232,6 +2235,10 @@ pub fn reflect_function(program: &Program, name: &str) -> Result<FunctionInfo, E
         return_type: function.return_type.clone(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Declaration generation
+// ---------------------------------------------------------------------------
 
 /// A structured declaration builder for compiler extensions. Declarations
 /// produced here are ordinary AST declarations; callers must pass the result

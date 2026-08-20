@@ -5,6 +5,7 @@
 //! are rejected instead of being silently emulated.
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::mir::{MirInstruction, MirProgram, MirTerminator};
+use crate::ops;
 use crate::typed::{
     DefId, FunctionId, IntegerWidth, LocalId, ResolvedType, TypedExpr, TypedPlace, TypedProgram,
 };
@@ -182,7 +183,7 @@ fn call_mir(
                         return Ok(evaluated);
                     }
                 }
-                MirInstruction::RunDefers { actions, .. } => {
+                MirInstruction::RunCleanup { actions, .. } => {
                     for action in actions {
                         let values = action
                             .arguments
@@ -192,7 +193,6 @@ fn call_mir(
                         let _ = call(program, globals, action.function, values)?;
                     }
                 }
-                MirInstruction::ScopeEnter | MirInstruction::ScopeExit => unreachable!(),
             }
         }
         match &block.terminator {
@@ -226,7 +226,7 @@ fn run_cleanup(
     program: &TypedProgram,
     globals: &mut Globals,
     env: &mut Env,
-    actions: &[crate::mir::MirDeferred],
+    actions: &[crate::mir::MirCleanup],
 ) -> Result<(), Error> {
     for action in actions {
         let values = action
@@ -574,116 +574,35 @@ fn layout_of(
     }
 }
 
-fn integer_info(ty: &ResolvedType) -> (u32, bool) {
-    match ty {
-        ResolvedType::Integer {
-            width: IntegerWidth::Bits(bits),
-            signed,
-        } => (*bits as u32, *signed),
-        ResolvedType::Integer {
-            width: IntegerWidth::Pointer,
-            signed,
-        } => (POINTER_BITS.load(Ordering::Relaxed), *signed),
-        _ => (128, true),
+fn primitive(value: Value) -> Result<ops::Value, Error> {
+    Ok(match value {
+        Value::Bool(value) => ops::Value::Bool(value),
+        Value::Int(value) => ops::Value::Integer(value),
+        Value::Float(value) => ops::Value::Float(value),
+        _ => return Err(Error("aggregate is not a primitive value".into())),
+    })
+}
+
+fn from_primitive(value: ops::Value) -> Value {
+    match value {
+        ops::Value::Bool(value) => Value::Bool(value),
+        ops::Value::Integer(value) => Value::Int(value),
+        ops::Value::Float(value) => Value::Float(value),
     }
 }
 
 fn normalize_integer(value: i128, ty: &ResolvedType) -> i128 {
-    let (bits, signed) = integer_info(ty);
-    let raw = (value as u128)
-        & if bits == 128 {
-            u128::MAX
-        } else {
-            (1u128 << bits) - 1
-        };
-    if signed && bits < 128 && (raw & (1u128 << (bits - 1))) != 0 {
-        (raw | (!0u128 << bits)) as i128
-    } else {
-        raw as i128
-    }
+    ops::normalize_with_pointer_width(value, ty, POINTER_BITS.load(Ordering::Relaxed))
 }
 
-fn integer_binary(op: BinaryOp, a: i128, b: i128, ty: &ResolvedType) -> Result<Value, Error> {
-    let (bits, signed) = integer_info(ty);
-    let mask = if bits == 128 {
-        u128::MAX
-    } else {
-        (1u128 << bits) - 1
-    };
-    let raw_a = (a as u128) & mask;
-    let raw_b = (b as u128) & mask;
-    let signed_a = normalize_integer(a, ty);
-    let signed_b = normalize_integer(b, ty);
-    let signed_min = if bits == 128 {
-        i128::MIN
-    } else {
-        -(1i128 << (bits - 1))
-    };
-    let out = match op {
-        BinaryOp::Add => Value::Int((raw_a.wrapping_add(raw_b) & mask) as i128),
-        BinaryOp::Subtract => Value::Int((raw_a.wrapping_sub(raw_b) & mask) as i128),
-        BinaryOp::Multiply => Value::Int((raw_a.wrapping_mul(raw_b) & mask) as i128),
-        BinaryOp::Divide => {
-            if raw_b == 0 || (signed && signed_a == signed_min && signed_b == -1) {
-                return Err(Error("integer division failed".into()));
-            }
-            if signed {
-                Value::Int(normalize_integer(signed_a / signed_b, ty))
-            } else {
-                Value::Int((raw_a / raw_b) as i128)
-            }
+fn ops_error(error: ops::Error) -> Error {
+    Error(
+        match error {
+            ops::Error::DivisionByZero => "integer division failed",
+            ops::Error::InvalidOperation => "unsupported primitive operation",
         }
-        BinaryOp::Modulo => {
-            if raw_b == 0 || (signed && signed_a == signed_min && signed_b == -1) {
-                return Err(Error("integer remainder failed".into()));
-            }
-            if signed {
-                Value::Int(normalize_integer(signed_a % signed_b, ty))
-            } else {
-                Value::Int((raw_a % raw_b) as i128)
-            }
-        }
-        BinaryOp::Equal => Value::Bool(raw_a == raw_b),
-        BinaryOp::NotEqual => Value::Bool(raw_a != raw_b),
-        BinaryOp::Less => Value::Bool(if signed {
-            signed_a < signed_b
-        } else {
-            raw_a < raw_b
-        }),
-        BinaryOp::LessEqual => Value::Bool(if signed {
-            signed_a <= signed_b
-        } else {
-            raw_a <= raw_b
-        }),
-        BinaryOp::Greater => Value::Bool(if signed {
-            signed_a > signed_b
-        } else {
-            raw_a > raw_b
-        }),
-        BinaryOp::GreaterEqual => Value::Bool(if signed {
-            signed_a >= signed_b
-        } else {
-            raw_a >= raw_b
-        }),
-        BinaryOp::BitwiseAnd => Value::Int(normalize_integer((raw_a & raw_b) as i128, ty)),
-        BinaryOp::BitwiseOr => Value::Int(normalize_integer((raw_a | raw_b) as i128, ty)),
-        BinaryOp::BitwiseXor => Value::Int(normalize_integer((raw_a ^ raw_b) as i128, ty)),
-        BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
-            if raw_b >= bits as u128 {
-                return Err(Error("invalid shift".into()));
-            }
-            let shift = raw_b as u32;
-            if op == BinaryOp::ShiftLeft {
-                Value::Int(normalize_integer((raw_a << shift) as i128, ty))
-            } else if signed {
-                Value::Int(normalize_integer(signed_a >> shift, ty))
-            } else {
-                Value::Int((raw_a >> shift) as i128)
-            }
-        }
-        _ => return Err(Error("unsupported integer operation".into())),
-    };
-    Ok(out)
+        .into(),
+    )
 }
 
 /// Whether an expression contains the explicit result-propagation operator.
@@ -753,46 +672,19 @@ fn as_usize(v: &Value) -> Result<usize, Error> {
         _ => Err(Error("index is not a non-negative integer".into())),
     }
 }
-fn unary(op: UnaryOp, v: Value, ty: &ResolvedType) -> Result<Value, Error> {
-    match (op, v) {
-        (UnaryOp::Negate, Value::Int(x)) => Ok(Value::Int(normalize_integer(-x, ty))),
-        (UnaryOp::Negate, Value::Float(x)) => Ok(Value::Float(-x)),
-        (UnaryOp::Not, Value::Bool(x)) => Ok(Value::Bool(!x)),
-        (UnaryOp::BitwiseNot, Value::Int(x)) => Ok(Value::Int(normalize_integer(!x, ty))),
-        _ => Err(Error("unsupported unary operation in interpreter".into())),
-    }
+fn unary(op: UnaryOp, value: Value, ty: &ResolvedType) -> Result<Value, Error> {
+    let value = primitive(value)?;
+    ops::unary_with_pointer_width(op, value, ty, POINTER_BITS.load(Ordering::Relaxed))
+        .map(from_primitive)
+        .map_err(ops_error)
 }
-fn binary(op: BinaryOp, a: Value, b: Value, operand_type: &ResolvedType) -> Result<Value, Error> {
-    if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-        return Ok(Value::Bool(if op == BinaryOp::LogicalAnd {
-            truth(&a)? && truth(&b)?
-        } else {
-            truth(&a)? || truth(&b)?
-        }));
-    }
-    match (a, b) {
-        (Value::Int(a), Value::Int(b)) => integer_binary(op, a, b, operand_type),
-        (Value::Float(a), Value::Float(b)) => Ok(match op {
-            BinaryOp::Add => Value::Float(a + b),
-            BinaryOp::Subtract => Value::Float(a - b),
-            BinaryOp::Multiply => Value::Float(a * b),
-            BinaryOp::Divide => Value::Float(a / b),
-            BinaryOp::Modulo => Value::Float(a % b),
-            BinaryOp::Equal => Value::Bool(a == b),
-            BinaryOp::NotEqual => Value::Bool(a != b),
-            BinaryOp::Less => Value::Bool(a < b),
-            BinaryOp::LessEqual => Value::Bool(a <= b),
-            BinaryOp::Greater => Value::Bool(a > b),
-            BinaryOp::GreaterEqual => Value::Bool(a >= b),
-            _ => return Err(Error("unsupported floating operation".into())),
-        }),
-        (Value::Bool(a), Value::Bool(b)) => Ok(match op {
-            BinaryOp::Equal => Value::Bool(a == b),
-            BinaryOp::NotEqual => Value::Bool(a != b),
-            _ => return Err(Error("unsupported boolean operation".into())),
-        }),
-        _ => Err(Error("operands have incompatible values".into())),
-    }
+
+fn binary(op: BinaryOp, left: Value, right: Value, ty: &ResolvedType) -> Result<Value, Error> {
+    let left = primitive(left)?;
+    let right = primitive(right)?;
+    ops::binary_with_pointer_width(op, left, right, ty, POINTER_BITS.load(Ordering::Relaxed))
+        .map(from_primitive)
+        .map_err(ops_error)
 }
 
 // Keep this import used in documentation and make type changes fail loudly at compile time.

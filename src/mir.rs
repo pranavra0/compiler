@@ -15,31 +15,6 @@ use crate::typed::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u32);
 
-/// Control-flow facts shared by validation and backend lowering. MIR
-/// terminators are authoritative; this compact summary is useful while a
-/// block is being constructed or emitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlowFlags(pub u8);
-
-impl FlowFlags {
-    pub const NORMAL: Self = Self(1);
-    pub const RETURN: Self = Self(2);
-    pub const BREAK: Self = Self(4);
-    pub const CONTINUE: Self = Self(8);
-
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 != 0
-    }
-
-    pub fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub fn without(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirProgram {
     pub functions: Vec<MirFunction>,
@@ -60,7 +35,7 @@ pub struct MirFunction {
     pub exported: bool,
     /// Cleanup actions active in each block. Expression-level propagation can
     /// leave a function without reaching an explicit return terminator.
-    pub cleanup: HashMap<BlockId, Vec<MirDeferred>>,
+    pub cleanup: HashMap<BlockId, Vec<MirCleanup>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,13 +47,9 @@ pub struct MirBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirInstruction {
-    ScopeEnter,
-    ScopeExit,
-    RunDefers {
-        /// Number of lexical scopes being exited, retained for diagnostics.
-        scopes: usize,
+    RunCleanup {
         /// Cleanup actions carry captured values and are explicit MIR data.
-        actions: Vec<MirDeferred>,
+        actions: Vec<MirCleanup>,
     },
     Declare {
         id: crate::typed::LocalId,
@@ -101,7 +72,7 @@ pub enum MirInstruction {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MirDeferred {
+pub struct MirCleanup {
     pub function: FunctionId,
     pub name: String,
     pub arguments: Vec<TypedExpr>,
@@ -204,18 +175,11 @@ impl MirFunction {
 
 struct Lowerer {
     blocks: Vec<MirBlock>,
-    cleanup: HashMap<BlockId, Vec<MirDeferred>>,
-    loops: Vec<LoopTargets>,
+    cleanup: HashMap<BlockId, Vec<MirCleanup>>,
+    loops: Vec<(BlockId, BlockId, usize)>,
     scope_depth: usize,
-    defers: Vec<Vec<MirDeferred>>,
+    defers: Vec<Vec<MirCleanup>>,
     next_capture: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LoopTargets {
-    break_block: BlockId,
-    continue_block: BlockId,
-    scope_depth: usize,
 }
 
 impl Lowerer {
@@ -225,7 +189,7 @@ impl Lowerer {
         id
     }
 
-    fn cleanup_actions(&self, first_scope: usize) -> Vec<MirDeferred> {
+    fn cleanup_actions(&self, first_scope: usize) -> Vec<MirCleanup> {
         self.defers
             .iter()
             .skip(first_scope)
@@ -309,11 +273,8 @@ impl Lowerer {
                         else_block: exit_block,
                         span: *span,
                     };
-                    self.loops.push(LoopTargets {
-                        break_block: exit_block,
-                        continue_block: condition_block,
-                        scope_depth: self.scope_depth,
-                    });
+                    self.loops
+                        .push((exit_block, condition_block, self.scope_depth));
                     let (body_end, body_falls) = self.lower_block(body, body_block)?;
                     self.loops.pop();
                     if body_falls {
@@ -323,45 +284,32 @@ impl Lowerer {
                     falls_through = true;
                 }
                 TypedStmt::Break { span } => {
-                    let Some(targets) = self.loops.last().copied() else {
+                    let Some((break_block, _, scope_depth)) = self.loops.last().copied() else {
                         return Err(MirError::BreakOutsideLoop { span: *span });
                     };
-                    let cleanup_scopes = self.scope_depth.saturating_sub(targets.scope_depth);
-                    let actions = self.cleanup_actions(targets.scope_depth);
+                    let actions = self.cleanup_actions(scope_depth);
                     self.block_mut(current)
                         .instructions
-                        .push(MirInstruction::RunDefers {
-                            scopes: cleanup_scopes,
-                            actions,
-                        });
-                    self.block_mut(current).terminator = MirTerminator::Jump(targets.break_block);
+                        .push(MirInstruction::RunCleanup { actions });
+                    self.block_mut(current).terminator = MirTerminator::Jump(break_block);
                     falls_through = false;
                 }
                 TypedStmt::Continue { span } => {
-                    let Some(targets) = self.loops.last().copied() else {
+                    let Some((_, continue_block, scope_depth)) = self.loops.last().copied() else {
                         return Err(MirError::ContinueOutsideLoop { span: *span });
                     };
-                    let cleanup_scopes = self.scope_depth.saturating_sub(targets.scope_depth);
-                    let actions = self.cleanup_actions(targets.scope_depth);
+                    let actions = self.cleanup_actions(scope_depth);
                     self.block_mut(current)
                         .instructions
-                        .push(MirInstruction::RunDefers {
-                            scopes: cleanup_scopes,
-                            actions,
-                        });
-                    self.block_mut(current).terminator =
-                        MirTerminator::Jump(targets.continue_block);
+                        .push(MirInstruction::RunCleanup { actions });
+                    self.block_mut(current).terminator = MirTerminator::Jump(continue_block);
                     falls_through = false;
                 }
                 TypedStmt::Return { value, .. } => {
-                    let cleanup_scopes = self.scope_depth;
                     let actions = self.cleanup_actions(0);
                     self.block_mut(current)
                         .instructions
-                        .push(MirInstruction::RunDefers {
-                            scopes: cleanup_scopes,
-                            actions,
-                        });
+                        .push(MirInstruction::RunCleanup { actions });
                     self.block_mut(current).terminator = MirTerminator::Return(value.clone());
                     falls_through = false;
                 }
@@ -395,7 +343,7 @@ impl Lowerer {
                     self.defers
                         .last_mut()
                         .expect("MIR scope stack is established before statements")
-                        .push(MirDeferred {
+                        .push(MirCleanup {
                             function: *function,
                             name: name.clone(),
                             arguments: captured,
@@ -448,7 +396,7 @@ impl Lowerer {
             let actions = self.cleanup_actions(self.scope_depth - 1);
             self.block_mut(current)
                 .instructions
-                .push(MirInstruction::RunDefers { scopes: 1, actions });
+                .push(MirInstruction::RunCleanup { actions });
         }
         // Later expressions in this block must see defers registered above.
         self.cleanup.insert(current, self.cleanup_actions(0));

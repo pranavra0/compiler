@@ -6,12 +6,11 @@ use crate::ast::{
     VariableDecl, VariableKind,
 };
 use crate::lexer::Span;
-use crate::mir::FlowFlags as Flow;
 use crate::modules::ModuleGraph;
 use crate::typed::{
     DefId, FunctionId, IntegerWidth, Intrinsic, LayoutKind, LocalId, LowLevelOperation,
-    ResolvedType, TypeInterner, TypedBlock, TypedConstant, TypedExpr, TypedField, TypedFunction,
-    TypedGlobal, TypedParameter, TypedPlace, TypedProgram, TypedStmt, TypedStruct,
+    ResolvedType, TypedBlock, TypedConstant, TypedExpr, TypedField, TypedFunction, TypedGlobal,
+    TypedParameter, TypedPlace, TypedProgram, TypedStmt, TypedStruct,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,39 +167,23 @@ impl SemanticError {
     }
 }
 
-#[derive(Debug, Clone)]
-struct FunctionSignature {
-    parameters: Vec<Type>,
-    return_type: Type,
-}
-#[derive(Debug, Clone)]
-struct Variable {
-    ty: Type,
-    mutable: bool,
-    constant_value: Option<Expr>,
-}
-#[derive(Debug, Clone)]
-struct StructInfo {
-    fields: Vec<(String, Type)>,
-}
 pub fn analyze(program: &Program) -> Result<(), SemanticError> {
-    // Keep the historical validation-only API, but route it through the
-    // authoritative typed frontend instead of maintaining a second pass.
     analyze_typed(program).map(|_| ())
 }
+
 pub fn analyze_typed(program: &Program) -> Result<TypedProgram, SemanticError> {
-    Analyzer::new().analyze_typed(program)
+    TypedLowerer::new_with_pointer_width(program, usize::BITS).lower()
 }
+
 pub fn analyze_typed_with_pointer_width(
     program: &Program,
     pointer_width: u32,
 ) -> Result<TypedProgram, SemanticError> {
-    Analyzer::with_pointer_width(pointer_width).analyze_typed(program)
+    TypedLowerer::new_with_pointer_width(program, pointer_width).lower()
 }
 
 /// Lower a graph-resolved compatibility view while taking declaration IDs
-/// from the canonical module graph. Name spellings remain only syntax and
-/// diagnostic metadata; typed references use these graph-owned IDs.
+/// from the canonical module graph.
 pub fn analyze_typed_with_graph(
     program: &Program,
     graph: &ModuleGraph,
@@ -209,1201 +192,45 @@ pub fn analyze_typed_with_graph(
     TypedLowerer::new_with_graph(program, graph, pointer_width).lower()
 }
 
-pub fn validate_entry_point(program: &Program) -> Result<(), SemanticError> {
-    let mut main = None;
-    for declaration in &program.declarations {
-        let Some((name, span)) = (match declaration {
-            Decl::Function(x) => Some((&x.name, x.span)),
-            Decl::Variable(x) => Some((&x.name, x.span)),
-            Decl::Struct(x) => Some((&x.name, x.span)),
-            Decl::Comptime { .. } => None,
-        }) else {
-            continue;
-        };
-        if name != "main" {
-            continue;
-        }
-        if main.is_some() {
-            return Err(SemanticError::InvalidEntryPoint {
-                message: "duplicate `main` declarations".into(),
-                span,
-            });
-        }
-        main = Some((declaration, span));
-    }
-    let Some((declaration, span)) = main else {
+/// Validate the native entry point after typed lowering. Keeping this check on
+/// the typed representation means clients never need a second AST pass.
+pub fn validate_typed_entry_point(program: &TypedProgram) -> Result<(), SemanticError> {
+    let mains: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|function| function.name == "main" && !function.is_extern)
+        .collect();
+    let Some(main) = mains.first() else {
         return Err(SemanticError::InvalidEntryPoint {
             message: "native build requires exactly one `main` function".into(),
             span: Span::new(0, 0),
         });
     };
-    let Decl::Function(function) = declaration else {
+    if mains.len() != 1 {
         return Err(SemanticError::InvalidEntryPoint {
-            message: "`main` must be a function".into(),
-            span,
-        });
-    };
-    if !function.params.is_empty() {
-        return Err(SemanticError::InvalidEntryPoint {
-            message: "`main` must not have parameters".into(),
-            span: function.span,
+            message: "duplicate `main` declarations".into(),
+            span: main.span,
         });
     }
-    if function.return_type != Type::Named("i32".into()) {
+    if !main.params.is_empty() {
+        return Err(SemanticError::InvalidEntryPoint {
+            message: "`main` must not have parameters".into(),
+            span: main.span,
+        });
+    }
+    if !matches!(
+        main.return_type,
+        ResolvedType::Integer {
+            width: IntegerWidth::Bits(32),
+            signed: true
+        }
+    ) {
         return Err(SemanticError::InvalidEntryPoint {
             message: "`main` must return i32".into(),
-            span: function.span,
+            span: main.span,
         });
     }
     Ok(())
-}
-
-pub struct Analyzer {
-    functions: HashMap<String, FunctionSignature>,
-    structs: HashMap<String, StructInfo>,
-    globals: HashMap<String, Variable>,
-    constants: HashMap<String, Variable>,
-    scopes: Vec<HashMap<String, Variable>>,
-    current_return_type: Option<Type>,
-    current_function: Option<String>,
-    loop_depth: usize,
-    pointer_width: u32,
-}
-impl Default for Analyzer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Analyzer {
-    pub fn new() -> Self {
-        Self::with_pointer_width(usize::BITS)
-    }
-    pub fn with_pointer_width(pointer_width: u32) -> Self {
-        Self {
-            functions: HashMap::new(),
-            structs: HashMap::new(),
-            globals: HashMap::new(),
-            constants: HashMap::new(),
-            scopes: Vec::new(),
-            current_return_type: None,
-            current_function: None,
-            loop_depth: 0,
-            pointer_width,
-        }
-    }
-    pub fn analyze(mut self, program: &Program) -> Result<(), SemanticError> {
-        self.collect_types(program)?;
-        self.collect_values(program)?;
-        for d in &program.declarations {
-            if let Decl::Function(f) = d
-                && !f.is_extern
-            {
-                self.analyze_function(f)?
-            }
-        }
-        Ok(())
-    }
-    pub fn analyze_typed(self, program: &Program) -> Result<TypedProgram, SemanticError> {
-        // Typed lowering is the authoritative frontend. It performs name,
-        // type, place, control-flow, and constant checks while constructing
-        // the representation consumed by every backend.
-        TypedLowerer::new_with_pointer_width(program, self.pointer_width).lower()
-    }
-
-    fn collect_types(&mut self, p: &Program) -> Result<(), SemanticError> {
-        for d in &p.declarations {
-            if let Decl::Struct(s) = d
-                && self
-                    .structs
-                    .insert(s.name.clone(), StructInfo { fields: Vec::new() })
-                    .is_some()
-            {
-                return Err(SemanticError::DuplicateName {
-                    name: s.name.clone(),
-                    span: s.span,
-                });
-            }
-        }
-        for d in &p.declarations {
-            if let Decl::Struct(s) = d {
-                let mut names = HashMap::new();
-                let mut fields = Vec::new();
-                for field in &s.fields {
-                    if names.insert(field.name.clone(), field.span).is_some() {
-                        return Err(SemanticError::DuplicateName {
-                            name: field.name.clone(),
-                            span: field.span,
-                        });
-                    }
-                    self.validate_value_type(&field.ty, field.span)?;
-                    fields.push((field.name.clone(), field.ty.clone()));
-                }
-                self.structs.insert(s.name.clone(), StructInfo { fields });
-            }
-        }
-        Ok(())
-    }
-    fn collect_values(&mut self, p: &Program) -> Result<(), SemanticError> {
-        let mut names = HashMap::<String, Span>::new();
-        for d in &p.declarations {
-            match d {
-                Decl::Function(f) => {
-                    if f.exported && f.abi.as_deref() != Some("c") {
-                        return Err(SemanticError::InvalidAbi {
-                            abi: "missing `c`".into(),
-                            span: f.span,
-                        });
-                    }
-                    if let Some(abi) = &f.abi {
-                        if abi != "c" {
-                            return Err(SemanticError::InvalidAbi {
-                                abi: abi.clone(),
-                                span: f.span,
-                            });
-                        }
-                        for parameter in &f.params {
-                            self.validate_ffi_type(&parameter.ty, parameter.span)?;
-                        }
-                        self.validate_ffi_type(&f.return_type, f.span)?;
-                    }
-                    if names.insert(f.name.clone(), f.span).is_some() {
-                        return Err(SemanticError::DuplicateName {
-                            name: f.name.clone(),
-                            span: f.span,
-                        });
-                    }
-                    for x in &f.params {
-                        self.validate_value_type(&x.ty, x.span)?
-                    }
-                    self.validate_return_type(&f.return_type, f.span)?;
-                    self.functions.insert(
-                        f.name.clone(),
-                        FunctionSignature {
-                            parameters: f.params.iter().map(|x| x.ty.clone()).collect(),
-                            return_type: f.return_type.clone(),
-                        },
-                    );
-                }
-                Decl::Variable(v) => {
-                    if names.insert(v.name.clone(), v.span).is_some() {
-                        return Err(SemanticError::DuplicateName {
-                            name: v.name.clone(),
-                            span: v.span,
-                        });
-                    }
-                    if matches!(v.kind, VariableKind::MutableInferred) {
-                        return Err(SemanticError::TopLevelVariableUnsupported {
-                            name: v.name.clone(),
-                            span: v.span,
-                        });
-                    }
-                    let ty = if let Some(t) = &v.ty {
-                        self.validate_value_type(t, v.span)?;
-                        self.check_expression(&v.value, Some(t))?
-                    } else {
-                        self.check_expression(&v.value, None)?
-                    };
-                    if let Some(t) = &v.ty {
-                        self.expect_type(t, &ty, v.value.span())?
-                    }
-                    if !self.is_compile_time(&v.value) {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "global initializer must be a compile-time constant".into(),
-                            span: v.value.span(),
-                        });
-                    }
-                    let mutable = matches!(v.kind, VariableKind::MutableTyped);
-                    let var = Variable {
-                        ty: ty.clone(),
-                        mutable,
-                        constant_value: (!mutable).then(|| v.value.clone()),
-                    };
-                    self.globals.insert(v.name.clone(), var.clone());
-                    if !var.mutable {
-                        self.constants.insert(v.name.clone(), var);
-                    }
-                }
-                Decl::Struct(_) | Decl::Comptime { .. } => {}
-            }
-        }
-        Ok(())
-    }
-    fn analyze_function(&mut self, f: &FunctionDecl) -> Result<(), SemanticError> {
-        self.current_function = Some(f.name.clone());
-        self.current_return_type = Some(f.return_type.clone());
-        self.scopes.push(HashMap::new());
-        for p in &f.params {
-            self.declare_local(
-                &p.name,
-                Variable {
-                    ty: p.ty.clone(),
-                    mutable: true,
-                    constant_value: None,
-                },
-                p.span,
-            )?
-        }
-        self.loop_depth = 0;
-        let flow = self.analyze_block_contents(&f.body)?;
-        self.scopes.pop();
-        self.current_function = None;
-        self.current_return_type = None;
-        if !is_unit(&f.return_type) && flow.contains(Flow::NORMAL) {
-            return Err(SemanticError::MissingReturn {
-                function: f.name.clone(),
-                span: f.body.span,
-            });
-        }
-        Ok(())
-    }
-    fn analyze_block(&mut self, b: &Block) -> Result<Flow, SemanticError> {
-        self.scopes.push(HashMap::new());
-        let x = self.analyze_block_contents(b);
-        self.scopes.pop();
-        x
-    }
-    fn analyze_block_contents(&mut self, b: &Block) -> Result<Flow, SemanticError> {
-        let mut flow = Flow::NORMAL;
-        for s in &b.statements {
-            let sf = self.analyze_statement(s)?;
-            if flow.contains(Flow::NORMAL) {
-                flow = flow.without(Flow::NORMAL).union(sf)
-            }
-        }
-        Ok(flow)
-    }
-    fn analyze_statement(&mut self, s: &Stmt) -> Result<Flow, SemanticError> {
-        match s {
-            Stmt::Variable(v) => {
-                let ty = self.variable_type(v)?;
-                self.declare_local(
-                    &v.name,
-                    Variable {
-                        ty,
-                        mutable: !matches!(v.kind, VariableKind::Immutable),
-                        constant_value: if matches!(v.kind, VariableKind::Immutable) {
-                            Some(v.value.clone())
-                        } else {
-                            None
-                        },
-                    },
-                    v.span,
-                )?;
-                Ok(if expression_propagates(&v.value) {
-                    Flow::RETURN
-                } else {
-                    Flow::NORMAL
-                })
-            }
-            Stmt::Assignment { target, value, .. } => {
-                let (ty, mutable) = self.check_place(target)?;
-                if !mutable {
-                    return Err(SemanticError::ImmutableAssignment {
-                        name: place_name(target),
-                        span: target.span(),
-                    });
-                }
-                let actual = self.check_expression(value, Some(&ty))?;
-                self.expect_type(&ty, &actual, value.span())?;
-                Ok(if expression_propagates(value) {
-                    Flow::RETURN
-                } else {
-                    Flow::NORMAL
-                })
-            }
-            Stmt::Expr { expression, .. } => {
-                self.check_expression(expression, None)?;
-                Ok(if expression_propagates(expression) {
-                    Flow::RETURN
-                } else {
-                    Flow::NORMAL
-                })
-            }
-            Stmt::Defer { call, span } => {
-                if !matches!(call, Expr::Call { .. }) {
-                    return Err(SemanticError::InvalidDefer {
-                        message: "defer requires a function call".into(),
-                        span: *span,
-                    });
-                }
-                self.check_expression(call, None)?;
-                Ok(Flow::NORMAL)
-            }
-            Stmt::Break { span } => {
-                if self.loop_depth == 0 {
-                    return Err(SemanticError::BreakOutsideLoop { span: *span });
-                }
-                Ok(Flow::BREAK)
-            }
-            Stmt::Continue { span } => {
-                if self.loop_depth == 0 {
-                    return Err(SemanticError::ContinueOutsideLoop { span: *span });
-                }
-                Ok(Flow::CONTINUE)
-            }
-            Stmt::Return { value, span } => {
-                let Some(expected) = self.current_return_type.clone() else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: "return outside a function".into(),
-                        span: *span,
-                    });
-                };
-                match (is_unit(&expected), value) {
-                    (true, None) => Ok(Flow::RETURN),
-                    (true, Some(e)) => Err(SemanticError::TypeMismatch {
-                        expected: Type::Unit,
-                        found: self.check_expression(e, None)?,
-                        span: *span,
-                    }),
-                    (false, None) => Err(SemanticError::TypeMismatch {
-                        expected: expected.clone(),
-                        found: Type::Unit,
-                        span: *span,
-                    }),
-                    (false, Some(e)) => {
-                        let a = self.check_expression(e, Some(&expected))?;
-                        self.expect_type(&expected, &a, e.span())?;
-                        Ok(Flow::RETURN)
-                    }
-                }
-            }
-            Stmt::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                let a = self.check_expression(condition, Some(&named("bool")))?;
-                self.expect_type(&named("bool"), &a, condition.span())?;
-                let t = self.analyze_block(then_branch)?;
-                let e = else_branch
-                    .as_ref()
-                    .map(|b| self.analyze_block(b))
-                    .transpose()?
-                    .unwrap_or(Flow::NORMAL);
-                Ok(t.union(e))
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                let a = self.check_expression(condition, Some(&named("bool")))?;
-                self.expect_type(&named("bool"), &a, condition.span())?;
-                let always = matches!(condition, Expr::Bool { value: true, .. });
-                self.loop_depth += 1;
-                let bf = self.analyze_block(body)?;
-                self.loop_depth -= 1;
-                let mut x = if bf.contains(Flow::RETURN) {
-                    Flow::RETURN
-                } else {
-                    Flow(0)
-                };
-                if !always || bf.contains(Flow::BREAK) {
-                    x = x.union(Flow::NORMAL)
-                }
-                Ok(x)
-            }
-        }
-    }
-    fn variable_type(&mut self, v: &VariableDecl) -> Result<Type, SemanticError> {
-        if let Some(t) = &v.ty {
-            self.validate_value_type(t, v.span)?
-        }
-        let ty = self.check_expression(&v.value, v.ty.as_ref())?;
-        if let Some(t) = &v.ty {
-            self.expect_type(t, &ty, v.value.span())?
-        }
-        Ok(ty)
-    }
-
-    fn check_expression(
-        &mut self,
-        e: &Expr,
-        expected: Option<&Type>,
-    ) -> Result<Type, SemanticError> {
-        let ty = match e {
-            Expr::Comptime { span, .. } => {
-                return Err(SemanticError::InvalidOperand {
-                    message: "compile-time marker was not expanded before semantic analysis".into(),
-                    span: *span,
-                });
-            }
-            Expr::Integer { value, span } => {
-                let t = expected
-                    .filter(|x| is_integer(x))
-                    .cloned()
-                    .unwrap_or_else(|| named("i32"));
-                if !integer_fits_with_width(*value, &t, self.pointer_width) {
-                    return Err(SemanticError::InvalidLiteral {
-                        message: format!("integer literal does not fit in {}", type_name(&t)),
-                        span: *span,
-                    });
-                }
-                t
-            }
-            Expr::Float { value, span } => {
-                let t = expected
-                    .filter(|x| is_float(x))
-                    .cloned()
-                    .unwrap_or_else(|| named("f64"));
-                if type_name(&t) == "f32" && !(*value as f32).is_finite() {
-                    return Err(SemanticError::InvalidLiteral {
-                        message: "floating-point literal does not fit in f32".into(),
-                        span: *span,
-                    });
-                }
-                t
-            }
-            Expr::Bool { .. } => named("bool"),
-            Expr::String { span, .. } => {
-                return Err(SemanticError::InvalidOperand {
-                    message: "strings are only available in compile-time context".into(),
-                    span: *span,
-                });
-            }
-            Expr::Propagate { expression, span } => {
-                let actual = self.check_expression(expression, None)?;
-                let Type::Result { success, error } = actual else {
-                    return Err(SemanticError::InvalidPropagation {
-                        message: "`?` requires a result value".into(),
-                        span: *span,
-                    });
-                };
-                let Some(Type::Result {
-                    error: current_error,
-                    ..
-                }) = self.current_return_type.as_ref()
-                else {
-                    return Err(SemanticError::InvalidPropagation {
-                        message: "`?` requires a result-returning function".into(),
-                        span: *span,
-                    });
-                };
-                if **current_error != *error {
-                    return Err(SemanticError::InvalidPropagation {
-                        message:
-                            "propagated error type is incompatible with the current return type"
-                                .into(),
-                        span: *span,
-                    });
-                }
-                *success
-            }
-            Expr::Null { span } => match expected {
-                Some(pointer @ Type::Pointer(_)) => pointer.clone(),
-                _ => {
-                    return Err(SemanticError::InvalidOperand {
-                        message: "null requires a pointer type context".into(),
-                        span: *span,
-                    });
-                }
-            },
-            Expr::SizeOf { ty, span } => {
-                self.validate_value_type(ty, *span)?;
-                named("usize")
-            }
-            Expr::AlignOf { ty, span } => {
-                self.validate_value_type(ty, *span)?;
-                named("usize")
-            }
-            Expr::OffsetOf { ty, field, span } => {
-                self.validate_value_type(ty, *span)?;
-                let Type::Named(name) = ty else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: "offset_of requires a struct type".into(),
-                        span: *span,
-                    });
-                };
-                let Some(info) = self.structs.get(name) else {
-                    return Err(SemanticError::UnknownType {
-                        name: name.clone(),
-                        span: *span,
-                    });
-                };
-                if !info.fields.iter().any(|(n, _)| n == field) {
-                    return Err(SemanticError::InvalidOperand {
-                        message: format!("unknown field `{field}`"),
-                        span: *span,
-                    });
-                }
-                named("usize")
-            }
-            Expr::Identifier { name, span } => {
-                if let Some(v) = self.lookup_variable(name) {
-                    v.ty
-                } else if let Some(v) = self.globals.get(name) {
-                    v.ty.clone()
-                } else if self.functions.contains_key(name) {
-                    return Err(SemanticError::InvalidOperand {
-                        message: format!("function `{name}` cannot be used as a value"),
-                        span: *span,
-                    });
-                } else {
-                    return Err(SemanticError::UndefinedName {
-                        name: name.clone(),
-                        span: *span,
-                    });
-                }
-            }
-            Expr::StructLiteral { name, fields, span } => {
-                let info =
-                    self.structs
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| SemanticError::UnknownType {
-                            name: name.clone(),
-                            span: *span,
-                        })?;
-                let t = named(name);
-                if let Some(exp) = expected {
-                    self.expect_type(exp, &t, *span)?
-                }
-                let mut seen = HashMap::new();
-                for f in fields {
-                    if seen.insert(f.name.clone(), ()).is_some() {
-                        return Err(SemanticError::DuplicateName {
-                            name: f.name.clone(),
-                            span: f.span,
-                        });
-                    }
-                    let Some((_, ft)) = info.fields.iter().find(|(n, _)| n == &f.name) else {
-                        return Err(SemanticError::InvalidOperand {
-                            message: format!("unknown field `{}`", f.name),
-                            span: f.span,
-                        });
-                    };
-                    let a = self.check_expression(&f.value, Some(ft))?;
-                    self.expect_type(ft, &a, f.value.span())?
-                }
-                if fields.len() != info.fields.len() {
-                    return Err(SemanticError::InvalidOperand {
-                        message: format!("struct `{name}` literal is missing a field"),
-                        span: *span,
-                    });
-                }
-                t
-            }
-            Expr::ArrayLiteral {
-                ty: at,
-                elements,
-                span,
-            } => {
-                self.validate_value_type(at, *span)?;
-                let t = at.clone();
-                if let Some(exp) = expected {
-                    self.expect_type(exp, &t, *span)?
-                }
-                let Type::Array { length, element } = at else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: "array literal requires an array type".into(),
-                        span: *span,
-                    });
-                };
-                if elements.len() as u64 != *length {
-                    return Err(SemanticError::InvalidOperand {
-                        message: format!(
-                            "array literal expects {length} elements, got {}",
-                            elements.len()
-                        ),
-                        span: *span,
-                    });
-                }
-                for x in elements {
-                    let a = self.check_expression(x, Some(element))?;
-                    self.expect_type(element, &a, x.span())?
-                }
-                t
-            }
-            Expr::Field { base, name, span } => {
-                let bt = self.check_expression(base, None)?;
-                let Type::Named(s) = &bt else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: "field access requires a struct".into(),
-                        span: *span,
-                    });
-                };
-                let Some(info) = self.structs.get(s) else {
-                    return Err(SemanticError::UnknownType {
-                        name: s.clone(),
-                        span: *span,
-                    });
-                };
-                let Some((_, t)) = info.fields.iter().find(|(n, _)| n == name) else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: format!("unknown field `{name}`"),
-                        span: *span,
-                    });
-                };
-                t.clone()
-            }
-            Expr::Index { base, index, span } | Expr::UncheckedIndex { base, index, span } => {
-                let bt = self.check_expression(base, None)?;
-                let it = self.check_expression(index, Some(&named("usize")))?;
-                self.expect_type(&named("usize"), &it, index.span())?;
-                match bt {
-                    Type::Array { length, element } => {
-                        if matches!(e, Expr::Index { .. })
-                            && let Some(i) = self.constant_integer(index)
-                            && (i < 0 || i as u64 >= length)
-                        {
-                            return Err(SemanticError::InvalidLiteral {
-                                message: "array index is out of bounds".into(),
-                                span: index.span(),
-                            });
-                        }
-                        *element
-                    }
-                    Type::Slice(element) => *element,
-                    _ => {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "indexing requires an array or slice".into(),
-                            span: *span,
-                        });
-                    }
-                }
-            }
-            Expr::Unary {
-                operator,
-                operand,
-                span,
-            } => {
-                if *operator == UnaryOp::AddressOf {
-                    let (ty, mutable) = self.check_place(operand)?;
-                    if !mutable {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "address-of requires a mutable lvalue".into(),
-                            span: operand.span(),
-                        });
-                    }
-                    let result = Type::Pointer(Box::new(ty));
-                    if let Some(expected) = expected {
-                        self.expect_type(expected, &result, *span)?;
-                    }
-                    return Ok(result);
-                }
-                if *operator == UnaryOp::Dereference {
-                    let a = self.check_expression(operand, None)?;
-                    if let Type::Pointer(element) = a {
-                        let result = *element;
-                        if let Some(expected) = expected {
-                            self.expect_type(expected, &result, *span)?;
-                        }
-                        return Ok(result);
-                    }
-                    return Err(SemanticError::InvalidOperand {
-                        message: "dereference requires a pointer".into(),
-                        span: *span,
-                    });
-                }
-                let oe = match operator {
-                    UnaryOp::Not => Some(named("bool")),
-                    _ => expected.filter(|t| is_numeric(t)).cloned(),
-                };
-                let a = self.check_expression(operand, oe.as_ref())?;
-                match operator {
-                    UnaryOp::Negate if !is_signed_integer(&a) && !is_float(&a) => {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "negation requires a signed integer or floating-point operand"
-                                .into(),
-                            span: *span,
-                        });
-                    }
-                    UnaryOp::Not if !is_bool(&a) => {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "logical not requires a boolean operand".into(),
-                            span: *span,
-                        });
-                    }
-                    UnaryOp::BitwiseNot if !is_integer(&a) => {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "bitwise not requires an integer operand".into(),
-                            span: *span,
-                        });
-                    }
-                    _ => {}
-                }
-                a
-            }
-            Expr::Binary {
-                left,
-                operator,
-                right,
-                span,
-            } => self.check_binary(left, *operator, right, *span, expected)?,
-            Expr::Call {
-                callee,
-                arguments,
-                span,
-            } => {
-                let Expr::Identifier { name, span: cs } = callee.as_ref() else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: "only named functions can be called currently".into(),
-                        span: callee.span(),
-                    });
-                };
-                if Intrinsic::from_name(name).is_some_and(Intrinsic::is_result) {
-                    let void_ok = name == "return_ok"
-                        && matches!(expected, Some(Type::Result { success, .. }) if is_unit(success));
-                    let expected_args = usize::from(!void_ok);
-                    if arguments.len() != expected_args {
-                        return Err(SemanticError::WrongArgumentCount {
-                            name: name.clone(),
-                            expected: expected_args,
-                            found: arguments.len(),
-                            span: *span,
-                        });
-                    }
-                    let arg = if void_ok {
-                        None
-                    } else {
-                        Some(self.check_expression(&arguments[0], None)?)
-                    };
-                    match name.as_str() {
-                        "is_err" => {
-                            if !matches!(arg.as_ref(), Some(Type::Result { .. })) {
-                                return Err(SemanticError::InvalidOperand {
-                                    message: "is_err requires a result value".into(),
-                                    span: *span,
-                                });
-                            }
-                            return Ok(named("bool"));
-                        }
-                        "unwrap" => {
-                            let Some(Type::Result { success, .. }) = arg else {
-                                return Err(SemanticError::InvalidOperand {
-                                    message: "unwrap requires a result value".into(),
-                                    span: *span,
-                                });
-                            };
-                            return Ok(*success);
-                        }
-                        "return_ok" | "return_err" => {
-                            let Some(Type::Result { success, error }) = expected else {
-                                return Err(SemanticError::InvalidOperand {
-                                    message: format!("{name} requires a result return context"),
-                                    span: *span,
-                                });
-                            };
-                            let wanted = if name == "return_ok" { success } else { error };
-                            if let Some(argument) = arguments.first() {
-                                let actual = self.check_expression(argument, Some(wanted))?;
-                                self.expect_type(wanted, &actual, argument.span())?;
-                            }
-                            return Ok(Type::Result {
-                                success: Box::new(*success.clone()),
-                                error: Box::new(*error.clone()),
-                            });
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                if matches!(Intrinsic::from_name(name), Some(Intrinsic::MakeSlice)) {
-                    if arguments.len() != 2 {
-                        return Err(SemanticError::WrongArgumentCount {
-                            name: name.clone(),
-                            expected: 2,
-                            found: arguments.len(),
-                            span: *span,
-                        });
-                    }
-                    let default_pointer = Type::Pointer(Box::new(named("u8")));
-                    let pointer = if matches!(&arguments[0], Expr::Null { .. }) {
-                        self.check_expression(&arguments[0], Some(&default_pointer))?
-                    } else {
-                        self.check_expression(&arguments[0], None)?
-                    };
-                    let Type::Pointer(element) = pointer else {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "make_slice requires a typed pointer".into(),
-                            span: arguments[0].span(),
-                        });
-                    };
-                    let length = self.check_expression(&arguments[1], Some(&named("usize")))?;
-                    self.expect_type(&named("usize"), &length, arguments[1].span())?;
-                    return Ok(Type::Slice(element));
-                }
-                if self.lookup_variable(name).is_some() {
-                    return Err(SemanticError::NotCallable {
-                        name: name.clone(),
-                        span: *cs,
-                    });
-                }
-                let Some(sig) = self.functions.get(name).cloned() else {
-                    return Err(SemanticError::UndefinedName {
-                        name: name.clone(),
-                        span: *cs,
-                    });
-                };
-                if sig.parameters.len() != arguments.len() {
-                    return Err(SemanticError::WrongArgumentCount {
-                        name: name.clone(),
-                        expected: sig.parameters.len(),
-                        found: arguments.len(),
-                        span: *span,
-                    });
-                }
-                for (a, t) in arguments.iter().zip(&sig.parameters) {
-                    let x = self.check_expression(a, Some(t))?;
-                    self.expect_type(t, &x, a.span())?
-                }
-                sig.return_type
-            }
-        };
-        if let Some(x) = expected {
-            self.expect_type(x, &ty, e.span())?
-        }
-        Ok(ty)
-    }
-    fn check_binary(
-        &mut self,
-        l: &Expr,
-        op: BinaryOp,
-        r: &Expr,
-        span: Span,
-        expected: Option<&Type>,
-    ) -> Result<Type, SemanticError> {
-        let left_type = self.check_expression(l, None)?;
-        if matches!(left_type, Type::Pointer(_)) {
-            match op {
-                BinaryOp::Add | BinaryOp::Subtract => {
-                    let integer_context = named("usize");
-                    let right = self.check_expression(
-                        r,
-                        if matches!(r, Expr::Integer { .. }) {
-                            Some(&integer_context)
-                        } else {
-                            None
-                        },
-                    )?;
-                    if op == BinaryOp::Subtract && right == left_type {
-                        return Ok(named("isize"));
-                    }
-                    if !matches!(right, Type::Named(ref n) if n == "usize" || n == "isize") {
-                        return Err(SemanticError::InvalidOperand {
-                            message: "pointer arithmetic requires usize or isize".into(),
-                            span,
-                        });
-                    }
-                    return Ok(left_type);
-                }
-                BinaryOp::Equal
-                | BinaryOp::NotEqual
-                | BinaryOp::Less
-                | BinaryOp::LessEqual
-                | BinaryOp::Greater
-                | BinaryOp::GreaterEqual => {
-                    let right = self.check_expression(r, Some(&left_type))?;
-                    self.expect_type(&left_type, &right, r.span())?;
-                    return Ok(named("bool"));
-                }
-                _ => {}
-            }
-        }
-        if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-            let b = named("bool");
-            let a = self.check_expression(l, Some(&b))?;
-            let c = self.check_expression(r, Some(&b))?;
-            self.expect_type(&b, &a, l.span())?;
-            self.expect_type(&b, &c, r.span())?;
-            return Ok(b);
-        }
-        if matches!(
-            op,
-            BinaryOp::Equal
-                | BinaryOp::NotEqual
-                | BinaryOp::Less
-                | BinaryOp::LessEqual
-                | BinaryOp::Greater
-                | BinaryOp::GreaterEqual
-        ) {
-            let a = self.check_expression(l, None)?;
-            let b = self.check_expression(r, Some(&a))?;
-            self.expect_type(&a, &b, r.span())?;
-            let valid = if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
-                (is_numeric(&a) && is_numeric(&b)) || (is_bool(&a) && is_bool(&b))
-            } else {
-                is_numeric(&a) && is_numeric(&b)
-            };
-            if !valid {
-                return Err(SemanticError::InvalidOperand{message:"comparison requires operands of the same numeric type (or bool for == and !=)".into(),span});
-            }
-            return Ok(named("bool"));
-        }
-        let oe = expected.filter(|t| is_numeric(t));
-        let a = if matches!(left_type, Type::Pointer(_)) {
-            left_type
-        } else {
-            self.check_expression(l, oe)?
-        };
-        let b = self.check_expression(r, Some(&a))?;
-        self.expect_type(&a, &b, r.span())?;
-        let valid = match op {
-            BinaryOp::Add
-            | BinaryOp::Subtract
-            | BinaryOp::Multiply
-            | BinaryOp::Divide
-            | BinaryOp::Modulo => is_numeric(&a),
-            BinaryOp::BitwiseAnd
-            | BinaryOp::BitwiseOr
-            | BinaryOp::BitwiseXor
-            | BinaryOp::ShiftLeft
-            | BinaryOp::ShiftRight => is_integer(&a),
-            _ => false,
-        };
-        if !valid {
-            return Err(SemanticError::InvalidOperand {
-                message: "operator requires operands of the same explicit numeric type".into(),
-                span,
-            });
-        }
-        Ok(a)
-    }
-    fn check_place(&mut self, e: &Expr) -> Result<(Type, bool), SemanticError> {
-        match e {
-            Expr::Identifier { name, span } => {
-                if let Some(v) = self.lookup_variable(name) {
-                    Ok((v.ty, v.mutable))
-                } else if let Some(v) = self.globals.get(name) {
-                    Ok((v.ty.clone(), v.mutable))
-                } else {
-                    Err(SemanticError::UndefinedName {
-                        name: name.clone(),
-                        span: *span,
-                    })
-                }
-            }
-            Expr::Field { base, name, span } => {
-                let (bt, m) = self.check_place(base)?;
-                let Type::Named(s) = bt else {
-                    return Err(SemanticError::InvalidAssignmentTarget { span: *span });
-                };
-                let Some(info) = self.structs.get(&s) else {
-                    return Err(SemanticError::UnknownType {
-                        name: s,
-                        span: *span,
-                    });
-                };
-                let Some((_, t)) = info.fields.iter().find(|(n, _)| n == name) else {
-                    return Err(SemanticError::InvalidOperand {
-                        message: format!("unknown field `{name}`"),
-                        span: *span,
-                    });
-                };
-                Ok((t.clone(), m))
-            }
-            Expr::Index { base, index, span } | Expr::UncheckedIndex { base, index, span } => {
-                let (bt, m) = self.check_place(base)?;
-                let it = self.check_expression(index, Some(&named("usize")))?;
-                self.expect_type(&named("usize"), &it, index.span())?;
-                match bt {
-                    Type::Array { length, element } => {
-                        if matches!(e, Expr::Index { .. })
-                            && let Some(i) = self.constant_integer(index)
-                            && (i < 0 || i as u64 >= length)
-                        {
-                            return Err(SemanticError::InvalidLiteral {
-                                message: "array index is out of bounds".into(),
-                                span: index.span(),
-                            });
-                        }
-                        Ok((*element, m))
-                    }
-                    Type::Slice(element) => Ok((*element, m)),
-                    _ => Err(SemanticError::InvalidAssignmentTarget { span: *span }),
-                }
-            }
-            Expr::Unary {
-                operator: UnaryOp::Dereference,
-                operand,
-                span,
-            } => {
-                let pointer = self.check_expression(operand, None)?;
-                match pointer {
-                    Type::Pointer(element) => Ok((*element, true)),
-                    _ => Err(SemanticError::InvalidAssignmentTarget { span: *span }),
-                }
-            }
-            _ => Err(SemanticError::InvalidAssignmentTarget { span: e.span() }),
-        }
-    }
-    fn declare_local(&mut self, name: &str, v: Variable, span: Span) -> Result<(), SemanticError> {
-        let s = self.scopes.last_mut().unwrap();
-        if s.contains_key(name) {
-            return Err(SemanticError::DuplicateName {
-                name: name.into(),
-                span,
-            });
-        }
-        s.insert(name.into(), v);
-        Ok(())
-    }
-    fn lookup_variable(&self, name: &str) -> Option<Variable> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
-    }
-    fn expect_type(&self, e: &Type, a: &Type, span: Span) -> Result<(), SemanticError> {
-        if e == a {
-            Ok(())
-        } else {
-            Err(SemanticError::TypeMismatch {
-                expected: e.clone(),
-                found: a.clone(),
-                span,
-            })
-        }
-    }
-    fn validate_value_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
-        if is_unit(t) {
-            return Err(SemanticError::UnknownType {
-                name: type_name(t),
-                span,
-            });
-        }
-        self.validate_type(t, span)
-    }
-    fn validate_return_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
-        self.validate_type(t, span)
-    }
-    fn validate_ffi_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
-        fn compatible(analyzer: &Analyzer, t: &Type, seen: &mut Vec<String>) -> bool {
-            match t {
-                Type::Unit => true,
-                Type::Named(name)
-                    if matches!(
-                        name.as_str(),
-                        "i8" | "i16"
-                            | "i32"
-                            | "i64"
-                            | "i128"
-                            | "u8"
-                            | "u16"
-                            | "u32"
-                            | "u64"
-                            | "u128"
-                            | "usize"
-                            | "isize"
-                            | "f32"
-                            | "f64"
-                    ) =>
-                {
-                    true
-                }
-                Type::Named(name) => {
-                    if seen.contains(name) {
-                        return true;
-                    }
-                    let Some(info) = analyzer.structs.get(name) else {
-                        return false;
-                    };
-                    seen.push(name.clone());
-                    let result = info
-                        .fields
-                        .iter()
-                        .all(|(_, field)| compatible(analyzer, field, seen));
-                    seen.pop();
-                    result
-                }
-                Type::Pointer(element) => {
-                    **element == Type::Unit || compatible(analyzer, element, seen)
-                }
-                Type::Array { element, .. } => compatible(analyzer, element, seen),
-                Type::Slice(_) | Type::Result { .. } => false,
-            }
-        }
-        if compatible(self, t, &mut Vec::new()) {
-            return Ok(());
-        }
-        Err(SemanticError::InvalidFfiType {
-            message: format!("type `{}` is not representable in the C ABI", type_name(t)),
-            span,
-        })
-    }
-    fn validate_type(&self, t: &Type, span: Span) -> Result<(), SemanticError> {
-        match t {
-            Type::Unit => Ok(()),
-            Type::Named(n) if is_known_type_name(n) || self.structs.contains_key(n) => Ok(()),
-            Type::Named(n) => Err(SemanticError::UnknownType {
-                name: n.clone(),
-                span,
-            }),
-            Type::Array { element, .. } | Type::Slice(element) => {
-                self.validate_value_type(element, span)
-            }
-            Type::Pointer(element) => {
-                if is_unit(element) {
-                    Ok(())
-                } else {
-                    self.validate_value_type(element, span)
-                }
-            }
-            Type::Result { success, error } => {
-                self.validate_type(success, span)?;
-                self.validate_value_type(error, span)
-            }
-        }
-    }
-    fn constant_integer(&self, e: &Expr) -> Option<i128> {
-        match e {
-            Expr::Integer { value, .. } => Some(*value),
-            Expr::Identifier { name, .. } => self
-                .lookup_variable(name)
-                .or_else(|| self.globals.get(name).cloned())
-                .and_then(|v| {
-                    v.constant_value
-                        .as_ref()
-                        .and_then(|x| self.constant_integer(x))
-                }),
-            Expr::Unary {
-                operator, operand, ..
-            } => {
-                let value = self.constant_integer(operand)?;
-                match operator {
-                    UnaryOp::Negate => Some(value.wrapping_neg()),
-                    UnaryOp::BitwiseNot => Some(!value),
-                    UnaryOp::Not | UnaryOp::AddressOf | UnaryOp::Dereference => None,
-                }
-            }
-            Expr::Binary {
-                left,
-                operator,
-                right,
-                ..
-            } => {
-                let a = self.constant_integer(left)?;
-                let b = self.constant_integer(right)?;
-                match operator {
-                    BinaryOp::Add => Some(a.wrapping_add(b)),
-                    BinaryOp::Subtract => Some(a.wrapping_sub(b)),
-                    BinaryOp::Multiply => Some(a.wrapping_mul(b)),
-                    BinaryOp::Divide if b != 0 => Some(a.wrapping_div(b)),
-                    BinaryOp::Modulo if b != 0 => Some(a.wrapping_rem(b)),
-                    BinaryOp::BitwiseAnd => Some(a & b),
-                    BinaryOp::BitwiseOr => Some(a | b),
-                    BinaryOp::BitwiseXor => Some(a ^ b),
-                    BinaryOp::ShiftLeft if (0..128).contains(&b) => Some(a.wrapping_shl(b as u32)),
-                    BinaryOp::ShiftRight if (0..128).contains(&b) => Some(a.wrapping_shr(b as u32)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn is_compile_time(&self, e: &Expr) -> bool {
-        match e {
-            Expr::Integer { .. } | Expr::Float { .. } | Expr::Bool { .. } => true,
-            Expr::Identifier { name, .. } => self.constants.contains_key(name),
-            Expr::StructLiteral { fields, .. } => {
-                fields.iter().all(|f| self.is_compile_time(&f.value))
-            }
-            Expr::ArrayLiteral { elements, .. } => elements.iter().all(|x| self.is_compile_time(x)),
-            Expr::SizeOf { .. } | Expr::AlignOf { .. } | Expr::OffsetOf { .. } => true,
-            Expr::Unary { operand, .. } => self.is_compile_time(operand),
-            Expr::Binary { left, right, .. } => {
-                self.is_compile_time(left) && self.is_compile_time(right)
-            }
-            _ => false,
-        }
-    }
 }
 
 struct TypedLowerer<'a> {
@@ -1498,6 +325,7 @@ impl<'a> TypedLowerer<'a> {
         }
     }
     fn lower(mut self) -> Result<TypedProgram, SemanticError> {
+        self.validate_program()?;
         let structs: Vec<TypedStruct> = self
             .program
             .declarations
@@ -1553,33 +381,132 @@ impl<'a> TypedLowerer<'a> {
             }
         }
         let symbols = self.symbol_table();
-        let mut types = TypeInterner::default();
-        for structure in &structs {
-            for field in &structure.fields {
-                intern_type(&mut types, &field.ty);
-            }
-        }
-        for global in &globals_out {
-            intern_type(&mut types, &global.ty);
-        }
-        for constant in &constants_out {
-            intern_type(&mut types, &constant.ty);
-        }
-        for function in &functions {
-            for parameter in &function.params {
-                intern_type(&mut types, &parameter.ty);
-            }
-            intern_type(&mut types, &function.return_type);
-        }
         Ok(TypedProgram {
             symbols,
-            types,
             structs,
             globals: globals_out,
             constants: constants_out,
             functions,
         })
     }
+    fn validate_program(&self) -> Result<(), SemanticError> {
+        let mut names = HashSet::new();
+        for declaration in &self.program.declarations {
+            let (name, span) = match declaration {
+                Decl::Function(function) => (&function.name, function.span),
+                Decl::Struct(structure) => (&structure.name, structure.span),
+                Decl::Variable(variable) => (&variable.name, variable.span),
+                Decl::Comptime { .. } => continue,
+            };
+            if !names.insert(name.clone()) {
+                return Err(SemanticError::DuplicateName {
+                    name: name.clone(),
+                    span,
+                });
+            }
+            match declaration {
+                Decl::Function(function) => {
+                    if function.exported && function.abi.as_deref() != Some("c") {
+                        return Err(SemanticError::InvalidAbi {
+                            abi: "missing `c`".into(),
+                            span: function.span,
+                        });
+                    }
+                    if let Some(abi) = &function.abi
+                        && abi != "c"
+                    {
+                        return Err(SemanticError::InvalidAbi {
+                            abi: abi.clone(),
+                            span: function.span,
+                        });
+                    }
+                    for parameter in &function.params {
+                        self.validate_value_type(&parameter.ty, parameter.span)?;
+                    }
+                    self.validate_type(&function.return_type, function.span)?;
+                }
+                Decl::Struct(structure) => {
+                    let mut fields = HashSet::new();
+                    for field in &structure.fields {
+                        if !fields.insert(field.name.clone()) {
+                            return Err(SemanticError::DuplicateName {
+                                name: field.name.clone(),
+                                span: field.span,
+                            });
+                        }
+                        self.validate_value_type(&field.ty, field.span)?;
+                    }
+                }
+                Decl::Variable(variable) => {
+                    if let Some(ty) = &variable.ty {
+                        self.validate_value_type(ty, variable.span)?;
+                    }
+                }
+                Decl::Comptime { .. } => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_type(&self, ty: &Type, span: Span) -> Result<(), SemanticError> {
+        match ty {
+            Type::Unit => Ok(()),
+            Type::Named(name)
+                if matches!(
+                    name.as_str(),
+                    "bool"
+                        | "i8"
+                        | "i16"
+                        | "i32"
+                        | "i64"
+                        | "i128"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "u128"
+                        | "usize"
+                        | "isize"
+                        | "f32"
+                        | "f64"
+                        | "void"
+                ) || self.structs.contains_key(name) =>
+            {
+                Ok(())
+            }
+            Type::Named(name) => Err(SemanticError::UnknownType {
+                name: name.clone(),
+                span,
+            }),
+            Type::Array { element, .. } | Type::Slice(element) => {
+                self.validate_value_type(element, span)
+            }
+            Type::Pointer(element) => {
+                if matches!(element.as_ref(), Type::Unit)
+                    || matches!(element.as_ref(), Type::Named(name) if name == "void")
+                {
+                    Ok(())
+                } else {
+                    self.validate_value_type(element, span)
+                }
+            }
+            Type::Result { success, error } => {
+                self.validate_type(success, span)?;
+                self.validate_value_type(error, span)
+            }
+        }
+    }
+
+    fn validate_value_type(&self, ty: &Type, span: Span) -> Result<(), SemanticError> {
+        if matches!(ty, Type::Unit) || matches!(ty, Type::Named(name) if name == "void") {
+            return Err(SemanticError::UnknownType {
+                name: "void".into(),
+                span,
+            });
+        }
+        self.validate_type(ty, span)
+    }
+
     fn declaration_index(&self, name: &str) -> u32 {
         self.definition_ids
             .get(name)
@@ -2916,24 +1843,6 @@ fn block_contains_break(block: &Block) -> bool {
     })
 }
 
-fn intern_type(interner: &mut TypeInterner, ty: &ResolvedType) {
-    interner.intern(ty.clone());
-    match ty {
-        ResolvedType::Array { element, .. }
-        | ResolvedType::Pointer(element)
-        | ResolvedType::Slice(element) => intern_type(interner, element),
-        ResolvedType::Result { success, error } => {
-            intern_type(interner, success);
-            intern_type(interner, error);
-        }
-        ResolvedType::Unit
-        | ResolvedType::Bool
-        | ResolvedType::Integer { .. }
-        | ResolvedType::Float { .. }
-        | ResolvedType::Struct(_) => {}
-    }
-}
-
 fn infer_ast_type_with_globals(e: &Expr, globals: &HashMap<String, (Type, bool)>) -> Type {
     match e {
         Expr::Integer { .. } => named("i32"),
@@ -2968,20 +1877,6 @@ fn infer_ast_type_with_globals(e: &Expr, globals: &HashMap<String, (Type, bool)>
             infer_ast_type_with_globals(&arguments[0], globals)
         }
         _ => named("i32"),
-    }
-}
-fn expression_propagates(e: &Expr) -> bool {
-    match e {
-        Expr::Propagate { .. } => true,
-        Expr::Call { arguments, .. } => arguments.iter().any(expression_propagates),
-        Expr::Binary { left, right, .. } => {
-            expression_propagates(left) || expression_propagates(right)
-        }
-        Expr::Unary { operand, .. } => expression_propagates(operand),
-        Expr::Field { base, .. } | Expr::Index { base, .. } | Expr::UncheckedIndex { base, .. } => {
-            expression_propagates(base)
-        }
-        _ => false,
     }
 }
 fn place_name(e: &Expr) -> String {
@@ -3096,30 +1991,6 @@ fn intp(signed: bool) -> ResolvedType {
         signed,
     }
 }
-fn is_unit(t: &Type) -> bool {
-    matches!(t, Type::Unit) || matches!(t,Type::Named(n)if n=="void")
-}
-fn is_known_type_name(n: &str) -> bool {
-    matches!(
-        n,
-        "bool"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "isize"
-            | "f32"
-            | "f64"
-            | "void"
-    )
-}
 fn type_name(t: &Type) -> String {
     match t {
         Type::Unit => "void".into(),
@@ -3130,41 +2001,6 @@ fn type_name(t: &Type) -> String {
         Type::Result { success, error } => format!("{} | {}", type_name(success), type_name(error)),
     }
 }
-fn is_bool(t: &Type) -> bool {
-    matches!(t,Type::Named(n)if n=="bool")
-}
-fn is_integer(t: &Type) -> bool {
-    matches!(t,Type::Named(n)if matches!(n.as_str(),"i8"|"i16"|"i32"|"i64"|"i128"|"u8"|"u16"|"u32"|"u64"|"u128"|"usize"|"isize"))
-}
-fn is_signed_integer(t: &Type) -> bool {
-    matches!(t,Type::Named(n)if matches!(n.as_str(),"i8"|"i16"|"i32"|"i64"|"i128"|"isize"))
-}
-fn is_float(t: &Type) -> bool {
-    matches!(t,Type::Named(n)if n=="f32"||n=="f64")
-}
-fn is_numeric(t: &Type) -> bool {
-    is_integer(t) || is_float(t)
-}
-fn integer_fits_with_width(v: i128, t: &Type, pointer_width: u32) -> bool {
-    match type_name(t).as_str() {
-        "i8" => i8::try_from(v).is_ok(),
-        "i16" => i16::try_from(v).is_ok(),
-        "i32" => i32::try_from(v).is_ok(),
-        "i64" => i64::try_from(v).is_ok(),
-        "i128" => true,
-        "u8" => u8::try_from(v).is_ok(),
-        "u16" => u16::try_from(v).is_ok(),
-        "u32" => u32::try_from(v).is_ok(),
-        "u64" => u64::try_from(v).is_ok(),
-        "u128" => v >= 0,
-        "usize" => v >= 0 && (pointer_width >= 128 || (v as u128) < (1u128 << pointer_width)),
-        "isize" => {
-            pointer_width >= 128
-                || (v >= -(1i128 << (pointer_width - 1)) && v < (1i128 << (pointer_width - 1)))
-        }
-        _ => false,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3173,7 +2009,7 @@ mod tests {
 
     fn check(source: &str) -> Result<TypedProgram, SemanticError> {
         let program = parse_source(source).expect("source should parse");
-        Analyzer::new().analyze_typed(&program)
+        analyze_typed(&program)
     }
 
     #[test]

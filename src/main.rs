@@ -9,7 +9,6 @@ use compiler::formatter;
 use compiler::interpreter;
 use compiler::modules;
 use compiler::pipeline::{self, FrontendError};
-use compiler::semantic;
 use compiler::source::SourceMap;
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
@@ -345,15 +344,13 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
         )
         .ok_or_else(|| "could not create the native LLVM target machine".to_string())?;
     let target_data = target_machine.get_target_data();
-    if !options.emit_object && !options.emit_ir && !options.emit_assembly {
-        semantic::validate_entry_point(&project.program).map_err(|error| {
-            let frontend = FrontendError::Semantic(error);
-            frontend_error(filename, &project.root_source, frontend)
-        })?;
+    let pointer_width = target_data.get_pointer_byte_size(None) * 8;
+    let typed = if options.emit_object || options.emit_ir || options.emit_assembly {
+        project.analyze(pointer_width)
+    } else {
+        project.analyze_native_with_pointer_width(pointer_width)
     }
-    let typed = project
-        .analyze(target_data.get_pointer_byte_size(None) * 8)
-        .map_err(|error| frontend_error(filename, &project.root_source, error))?;
+    .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let context = Context::create();
     let generator = CodeGenerator::with_target_data(&context, module_name(&output), &target_data);
     let generator = if options.debug {

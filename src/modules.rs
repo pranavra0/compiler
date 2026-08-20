@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::ast::*;
 use crate::lexer::Span;
 use crate::pipeline;
+use crate::semantic;
 use crate::typed::{DefId, DefinitionKind, ModuleId, TypedProgram};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,7 +172,16 @@ impl Project {
     }
 
     pub fn analyze_native(&self) -> Result<TypedProgram, pipeline::FrontendError> {
-        self.analyze(usize::BITS)
+        self.analyze_native_with_pointer_width(usize::BITS)
+    }
+
+    pub fn analyze_native_with_pointer_width(
+        &self,
+        pointer_width: u32,
+    ) -> Result<TypedProgram, pipeline::FrontendError> {
+        let typed = self.analyze(pointer_width)?;
+        semantic::validate_typed_entry_point(&typed).map_err(pipeline::FrontendError::Semantic)?;
+        Ok(typed)
     }
 }
 

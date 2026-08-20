@@ -1,7 +1,7 @@
 use crate::ast::Program;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::lexer::Span;
-use crate::mir::{FlowFlags as Flow, MirFunction, MirInstruction, MirProgram, MirTerminator};
+use crate::mir::{MirFunction, MirInstruction, MirProgram, MirTerminator};
 use crate::pipeline;
 use crate::typed::{
     DefId, FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedExpr,
@@ -74,17 +74,6 @@ struct Local<'ctx> {
     pointer: PointerValue<'ctx>,
     llvm_type: BasicTypeEnum<'ctx>,
 }
-#[derive(Clone, Copy)]
-struct LoopTargets<'ctx> {
-    continue_block: BasicBlock<'ctx>,
-    break_block: BasicBlock<'ctx>,
-    defer_depth: usize,
-}
-#[derive(Clone)]
-struct Deferred<'ctx> {
-    function: FunctionValue<'ctx>,
-    arguments: Vec<BasicMetadataValueEnum<'ctx>>,
-}
 pub struct CodeGenerator<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
@@ -100,12 +89,11 @@ pub struct CodeGenerator<'ctx> {
     current_return_type: ResolvedType,
     pointer_width: u32,
     target_data: TargetData,
-    loop_targets: Vec<LoopTargets<'ctx>>,
-    defer_scopes: Vec<Vec<Deferred<'ctx>>>,
     debug: Option<(String, bool, String)>,
     debug_locals: Vec<DebugLocal<'ctx>>,
     debug_locations: HashMap<usize, inkwell::debug_info::DILocation<'ctx>>,
-    mir_cleanup: Vec<crate::mir::MirDeferred>,
+    /// Cleanup is selected from the MIR block currently being emitted.
+    current_cleanup: Vec<crate::mir::MirCleanup>,
 }
 
 impl<'ctx> CodeGenerator<'ctx> {
@@ -134,12 +122,10 @@ impl<'ctx> CodeGenerator<'ctx> {
             current_return_type: ResolvedType::Unit,
             pointer_width,
             target_data,
-            loop_targets: Vec::new(),
-            defer_scopes: Vec::new(),
             debug: None,
             debug_locals: Vec::new(),
             debug_locations: HashMap::new(),
-            mir_cleanup: Vec::new(),
+            current_cleanup: Vec::new(),
         }
     }
     pub fn with_debug_info(mut self, filename: impl Into<String>, optimized: bool) -> Self {
@@ -175,12 +161,10 @@ impl<'ctx> CodeGenerator<'ctx> {
             current_return_type: ResolvedType::Unit,
             pointer_width: w,
             target_data,
-            loop_targets: Vec::new(),
-            defer_scopes: Vec::new(),
             debug: None,
             debug_locals: Vec::new(),
             debug_locations: HashMap::new(),
-            mir_cleanup: Vec::new(),
+            current_cleanup: Vec::new(),
         }
     }
     pub fn generate(self, p: &Program) -> Result<Module<'ctx>, CodegenError> {
@@ -261,7 +245,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     let mir_function = mir
                         .function(f.id)
                         .ok_or_else(|| CodegenError::new("missing MIR function"))?;
-                    self.generate_mir_function(mir_function)?;
+                    self.emit_function(mir_function)?;
                     // Preserve parameter names in DWARF. Values may still be
                     // optimized away, so this is intentionally best-effort.
                     for (index, parameter) in f.params.iter().enumerate() {
@@ -332,7 +316,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                     let mir_function = mir
                         .function(f.id)
                         .ok_or_else(|| CodegenError::new("missing MIR function"))?;
-                    self.generate_mir_function(mir_function)?;
+                    self.emit_function(mir_function)?;
                 }
             }
         }
@@ -513,15 +497,17 @@ impl<'ctx> CodeGenerator<'ctx> {
         }
     }
 
-    fn generate_mir_function(&mut self, f: &MirFunction) -> Result<(), CodegenError> {
+    /// Emit one complete MIR function. LLVM sees only the blocks and
+    /// instructions produced by MIR; source-level structured statements never
+    /// reach this backend.
+    fn emit_function(&mut self, f: &MirFunction) -> Result<(), CodegenError> {
         let fun = self.functions[&f.id];
         self.current_function = Some(fun);
         self.current_function_id = f.id;
         self.current_return_type = f.return_type.clone();
         self.locals.clear();
         self.debug_locals.clear();
-        self.loop_targets.clear();
-        self.defer_scopes.clear();
+        self.current_cleanup.clear();
 
         let blocks = f
             .blocks
@@ -552,111 +538,13 @@ impl<'ctx> CodeGenerator<'ctx> {
         }
         for block in &f.blocks {
             self.builder.position_at_end(blocks[&block.id]);
-            self.mir_cleanup = f.cleanup.get(&block.id).cloned().unwrap_or_default();
+            self.current_cleanup = f.cleanup.get(&block.id).cloned().unwrap_or_default();
             for instruction in &block.instructions {
-                match instruction {
-                    MirInstruction::Declare {
-                        id,
-                        name,
-                        ty,
-                        mutable,
-                        value,
-                        span,
-                    } => {
-                        self.generate_statement(&TypedStmt::Declare {
-                            id: *id,
-                            name: name.clone(),
-                            ty: ty.clone(),
-                            mutable: *mutable,
-                            value: value.clone(),
-                            span: *span,
-                        })?;
-                    }
-                    MirInstruction::Store {
-                        target,
-                        value,
-                        ty,
-                        span,
-                    } => {
-                        self.generate_statement(&TypedStmt::Store {
-                            target: target.clone(),
-                            value: value.clone(),
-                            ty: ty.clone(),
-                            span: *span,
-                        })?;
-                    }
-                    MirInstruction::Expr { expression, span } => {
-                        self.generate_statement(&TypedStmt::Expr {
-                            expression: expression.clone(),
-                            span: *span,
-                        })?;
-                    }
-                    MirInstruction::RunDefers { actions, .. } => {
-                        for action in actions {
-                            let arguments = action
-                                .arguments
-                                .iter()
-                                .map(|argument| {
-                                    let value = self.generate_expression(argument)?;
-                                    let value = self.abi_pack(
-                                        value,
-                                        action.function,
-                                        argument.ty(),
-                                        argument.span(),
-                                    )?;
-                                    Ok(BasicMetadataValueEnum::from(value))
-                                })
-                                .collect::<Result<Vec<_>, CodegenError>>()?;
-                            let function = self
-                                .functions
-                                .get(&action.function)
-                                .copied()
-                                .ok_or_else(|| {
-                                    CodegenError::at("unknown deferred function", action.span)
-                                })?;
-                            self.builder
-                                .build_call(function, &arguments, "defer.call")?;
-                        }
-                    }
-                    MirInstruction::ScopeEnter | MirInstruction::ScopeExit => {
-                        return Err(CodegenError::new("legacy MIR cleanup marker"));
-                    }
-                }
+                self.emit_instruction(instruction)?;
             }
-            match &block.terminator {
-                MirTerminator::Jump(target) => {
-                    self.builder.build_unconditional_branch(blocks[target])?;
-                }
-                MirTerminator::Branch {
-                    condition,
-                    then_block,
-                    else_block,
-                    span,
-                } => {
-                    if let Some(location) = self.debug_locations.get(&span.start).copied() {
-                        self.builder.set_current_debug_location(location);
-                    }
-                    let value = self.generate_expression(condition)?;
-                    let value = self.as_condition(value, condition.span())?;
-                    self.builder.build_conditional_branch(
-                        value,
-                        blocks[then_block],
-                        blocks[else_block],
-                    )?;
-                }
-                MirTerminator::Return(value) => {
-                    let statement = TypedStmt::Return {
-                        value: value.clone(),
-                        span: value.as_ref().map(TypedExpr::span).unwrap_or(f.span),
-                    };
-                    self.generate_statement(&statement)?;
-                }
-                MirTerminator::Unreachable => {
-                    self.builder.build_unreachable()?;
-                }
-            }
+            self.emit_terminator(&block.terminator, f.span, &blocks)?;
         }
-        self.defer_scopes.clear();
+        self.current_cleanup.clear();
         if !fun.verify(true) {
             return Err(CodegenError::new(format!(
                 "LLVM verification failed for function `{}`",
@@ -666,52 +554,34 @@ impl<'ctx> CodeGenerator<'ctx> {
         Ok(())
     }
 
-    fn generate_block(&mut self, b: &TypedBlock) -> Result<Flow, CodegenError> {
-        let saved = self.locals.clone();
-        self.defer_scopes.push(Vec::new());
-        let mut flow = Flow::NORMAL;
-        for s in &b.statements {
-            if flow.contains(Flow::NORMAL) {
-                flow = flow
-                    .without(Flow::NORMAL)
-                    .union(self.generate_statement(s)?);
-            }
-        }
-        if flow.contains(Flow::NORMAL) {
-            self.emit_defers_from(self.defer_scopes.len() - 1)?;
-        }
-        self.defer_scopes.pop();
-        self.locals = saved;
-        Ok(flow)
-    }
-    fn generate_statement(&mut self, s: &TypedStmt) -> Result<Flow, CodegenError> {
-        if let Some(location) = self.debug_locations.get(&s_span(s).start).copied() {
-            self.builder.set_current_debug_location(location);
-        }
-        match s {
-            TypedStmt::Declare {
+    /// Emit one MIR instruction. This is intentionally a direct adapter: no
+    /// control-flow or scope stack is reconstructed here.
+    fn emit_instruction(&mut self, instruction: &MirInstruction) -> Result<(), CodegenError> {
+        match instruction {
+            MirInstruction::Declare {
                 id,
                 name,
                 ty,
                 mutable: _,
                 value,
                 span,
-                ..
             } => {
-                let lt = self.basic_type(ty.clone())?;
-                let v = self.generate_expression(value)?;
-                if v.get_type() != lt {
+                if let Some(location) = self.debug_locations.get(&span.start).copied() {
+                    self.builder.set_current_debug_location(location);
+                }
+                let llvm_type = self.basic_type(ty.clone())?;
+                let value = self.generate_expression(value)?;
+                if value.get_type() != llvm_type {
                     return Err(CodegenError::at(
                         "initializer has the wrong resolved type",
-                        s_span(s),
+                        *span,
                     ));
                 }
-                let p = self.builder.build_alloca(lt, &format!("{name}.addr"))?;
-                self.builder.build_store(p, v)?;
-                let local = Local {
-                    pointer: p,
-                    llvm_type: lt,
-                };
+                let pointer = self
+                    .builder
+                    .build_alloca(llvm_type, &format!("{name}.addr"))?;
+                self.builder.build_store(pointer, value)?;
+                let local = Local { pointer, llvm_type };
                 self.locals.insert(*id, local.clone());
                 if self.debug.is_some() {
                     self.debug_locals.push(DebugLocal {
@@ -721,54 +591,27 @@ impl<'ctx> CodeGenerator<'ctx> {
                         span: *span,
                     });
                 }
-                Ok(Flow::NORMAL)
             }
-            TypedStmt::Store {
+            MirInstruction::Store {
                 target,
                 value,
                 ty,
                 span,
             } => {
-                let p = self.place_pointer(target, *span)?;
-                let v = self.generate_expression(value)?;
-                if v.get_type() != self.basic_type(ty.clone())? {
+                if let Some(location) = self.debug_locations.get(&span.start).copied() {
+                    self.builder.set_current_debug_location(location);
+                }
+                let pointer = self.place_pointer(target, *span)?;
+                let value = self.generate_expression(value)?;
+                if value.get_type() != self.basic_type(ty.clone())? {
                     return Err(CodegenError::at("assigned value has the wrong type", *span));
                 }
-                self.builder.build_store(p, v)?;
-                Ok(Flow::NORMAL)
+                self.builder.build_store(pointer, value)?;
             }
-            TypedStmt::Return { value, span } => {
-                self.emit_defers_from(0)?;
-                match (self.current_return_type.clone(), value) {
-                    (ResolvedType::Unit, None) => {
-                        self.builder.build_return(None)?;
-                    }
-                    (ResolvedType::Unit, Some(_)) => {
-                        return Err(CodegenError::at(
-                            "void function cannot return a value",
-                            *span,
-                        ));
-                    }
-                    (_, None) => {
-                        return Err(CodegenError::at(
-                            "non-void function must return a value",
-                            *span,
-                        ));
-                    }
-                    (_, Some(x)) => {
-                        let v = self.generate_expression(x)?;
-                        let v = self.abi_pack(
-                            v,
-                            self.current_function_id,
-                            self.current_return_type.clone(),
-                            *span,
-                        )?;
-                        self.builder.build_return(Some(&v))?;
-                    }
+            MirInstruction::Expr { expression, span } => {
+                if let Some(location) = self.debug_locations.get(&span.start).copied() {
+                    self.builder.set_current_debug_location(location);
                 }
-                Ok(Flow::RETURN)
-            }
-            TypedStmt::Expr { expression, .. } => {
                 if let TypedExpr::Call {
                     function,
                     arguments,
@@ -780,78 +623,113 @@ impl<'ctx> CodeGenerator<'ctx> {
                 } else {
                     self.generate_expression(expression)?;
                 }
-                Ok(Flow::NORMAL)
             }
-            TypedStmt::Defer {
-                function,
-                arguments,
-                ..
-            } => {
-                let mut values = Vec::with_capacity(arguments.len());
-                for argument in arguments {
-                    let value = self.generate_expression(argument)?;
-                    let value = self.abi_pack(value, *function, argument.ty(), argument.span())?;
-                    values.push(BasicMetadataValueEnum::from(value));
-                }
-                self.defer_scopes
-                    .last_mut()
-                    .ok_or_else(|| CodegenError::new("defer outside a scope"))?
-                    .push(Deferred {
-                        function: self
-                            .functions
-                            .get(function)
+            MirInstruction::RunCleanup { actions, .. } => {
+                for action in actions {
+                    let arguments = action
+                        .arguments
+                        .iter()
+                        .map(|argument| {
+                            let value = self.generate_expression(argument)?;
+                            let value = self.abi_pack(
+                                value,
+                                action.function,
+                                argument.ty(),
+                                argument.span(),
+                            )?;
+                            Ok(BasicMetadataValueEnum::from(value))
+                        })
+                        .collect::<Result<Vec<_>, CodegenError>>()?;
+                    let function =
+                        self.functions
+                            .get(&action.function)
                             .copied()
-                            .ok_or_else(|| CodegenError::new("unknown deferred function"))?,
-                        arguments: values,
-                    });
-                Ok(Flow::NORMAL)
+                            .ok_or_else(|| {
+                                CodegenError::at("unknown deferred function", action.span)
+                            })?;
+                    self.builder
+                        .build_call(function, &arguments, "defer.call")?;
+                }
             }
-            TypedStmt::Break { span } => {
-                let t = self
-                    .loop_targets
-                    .last()
-                    .copied()
-                    .ok_or_else(|| CodegenError::at("break is outside a loop", *span))?;
-                self.emit_defers_from(t.defer_depth)?;
-                self.builder.build_unconditional_branch(t.break_block)?;
-                Ok(Flow::BREAK)
-            }
-            TypedStmt::Continue { span } => {
-                let t = self
-                    .loop_targets
-                    .last()
-                    .copied()
-                    .ok_or_else(|| CodegenError::at("continue is outside a loop", *span))?;
-                self.emit_defers_from(t.defer_depth)?;
-                self.builder.build_unconditional_branch(t.continue_block)?;
-                Ok(Flow::CONTINUE)
-            }
-            TypedStmt::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => self.generate_if(condition, then_branch, else_branch.as_ref()),
-            TypedStmt::While {
-                condition, body, ..
-            } => self.generate_while(condition, body),
-        }
-    }
-    fn emit_defers_from(&mut self, depth: usize) -> Result<(), CodegenError> {
-        let actions: Vec<Deferred<'ctx>> = self.defer_scopes[depth..]
-            .iter()
-            .rev()
-            .flat_map(|scope| scope.iter().rev().cloned())
-            .collect();
-        for action in actions {
-            self.builder
-                .build_call(action.function, &action.arguments, "defer.call")?;
         }
         Ok(())
     }
 
-    fn emit_mir_cleanup(&mut self) -> Result<(), CodegenError> {
-        let actions = self.mir_cleanup.clone();
+    /// Emit one MIR terminator. Terminators are the only place this adapter
+    /// creates control-flow edges.
+    fn emit_terminator(
+        &mut self,
+        terminator: &MirTerminator,
+        function_span: Span,
+        blocks: &HashMap<crate::mir::BlockId, BasicBlock<'ctx>>,
+    ) -> Result<(), CodegenError> {
+        match terminator {
+            MirTerminator::Jump(target) => {
+                self.builder.build_unconditional_branch(blocks[target])?;
+            }
+            MirTerminator::Branch {
+                condition,
+                then_block,
+                else_block,
+                span,
+            } => {
+                if let Some(location) = self.debug_locations.get(&span.start).copied() {
+                    self.builder.set_current_debug_location(location);
+                }
+                let raw = self.generate_expression(condition)?;
+                let value = self.as_condition(raw, condition.span())?;
+                self.builder.build_conditional_branch(
+                    value,
+                    blocks[then_block],
+                    blocks[else_block],
+                )?;
+            }
+            MirTerminator::Return(value) => {
+                self.emit_return(
+                    value.as_ref(),
+                    value.as_ref().map(TypedExpr::span).unwrap_or(function_span),
+                )?;
+            }
+            MirTerminator::Unreachable => {
+                self.builder.build_unreachable()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_return(&mut self, value: Option<&TypedExpr>, span: Span) -> Result<(), CodegenError> {
+        match (self.current_return_type.clone(), value) {
+            (ResolvedType::Unit, None) => {
+                self.builder.build_return(None)?;
+            }
+            (ResolvedType::Unit, Some(_)) => {
+                return Err(CodegenError::at(
+                    "void function cannot return a value",
+                    span,
+                ));
+            }
+            (_, None) => {
+                return Err(CodegenError::at(
+                    "non-void function must return a value",
+                    span,
+                ));
+            }
+            (_, Some(expression)) => {
+                let value = self.generate_expression(expression)?;
+                let value = self.abi_pack(
+                    value,
+                    self.current_function_id,
+                    self.current_return_type.clone(),
+                    span,
+                )?;
+                self.builder.build_return(Some(&value))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_cleanup(&mut self) -> Result<(), CodegenError> {
+        let actions = self.current_cleanup.clone();
         for action in actions {
             let arguments = action
                 .arguments
@@ -872,81 +750,6 @@ impl<'ctx> CodeGenerator<'ctx> {
                 .build_call(function, &arguments, "defer.call")?;
         }
         Ok(())
-    }
-    fn generate_if(
-        &mut self,
-        c: &TypedExpr,
-        t: &TypedBlock,
-        e: Option<&TypedBlock>,
-    ) -> Result<Flow, CodegenError> {
-        let raw = self.generate_expression(c)?;
-        let cv = self.as_condition(raw, c.span())?;
-        let f = self.current_function.unwrap();
-        let tb = self.context.append_basic_block(f, "if.then");
-        let eb = self.context.append_basic_block(f, "if.else");
-        let end = self.context.append_basic_block(f, "if.end");
-        self.builder.build_conditional_branch(cv, tb, eb)?;
-        self.builder.position_at_end(tb);
-        let tf = self.generate_block(t)?;
-        if tf.contains(Flow::NORMAL) {
-            self.builder.build_unconditional_branch(end)?;
-        }
-        self.builder.position_at_end(eb);
-        let ef = match e {
-            Some(x) => self.generate_block(x)?,
-            None => Flow::NORMAL,
-        };
-        if ef.contains(Flow::NORMAL) {
-            self.builder.build_unconditional_branch(end)?;
-        }
-        let flow = tf.union(ef);
-        self.builder.position_at_end(end);
-        if !flow.contains(Flow::NORMAL) {
-            self.builder.build_unreachable()?;
-        }
-        Ok(flow)
-    }
-    fn generate_while(&mut self, c: &TypedExpr, b: &TypedBlock) -> Result<Flow, CodegenError> {
-        let f = self.current_function.unwrap();
-        let cb = self.context.append_basic_block(f, "while.cond");
-        let bb = self.context.append_basic_block(f, "while.body");
-        let eb = self.context.append_basic_block(f, "while.end");
-        self.builder.build_unconditional_branch(cb)?;
-        self.builder.position_at_end(cb);
-        let raw = self.generate_expression(c)?;
-        let cv = self.as_condition(raw, c.span())?;
-        let always = matches!(c, TypedExpr::Bool { value: true, .. });
-        if always {
-            self.builder.build_unconditional_branch(bb)?;
-        } else {
-            self.builder.build_conditional_branch(cv, bb, eb)?;
-        }
-        let defer_depth = self.defer_scopes.len();
-        self.loop_targets.push(LoopTargets {
-            continue_block: cb,
-            break_block: eb,
-            defer_depth,
-        });
-        self.builder.position_at_end(bb);
-        let bf = self.generate_block(b)?;
-        self.loop_targets.pop();
-        if bf.contains(Flow::NORMAL) {
-            self.builder.build_unconditional_branch(cb)?;
-        }
-        self.builder.position_at_end(eb);
-        let exit = !always || bf.contains(Flow::BREAK);
-        if always && !exit {
-            self.builder.build_unreachable()?;
-        }
-        let mut flow = if bf.contains(Flow::RETURN) {
-            Flow::RETURN
-        } else {
-            Flow(0)
-        };
-        if exit {
-            flow = flow.union(Flow::NORMAL)
-        }
-        Ok(flow)
     }
 
     fn generate_expression(&mut self, e: &TypedExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
@@ -1060,7 +863,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                 let ok = self.context.append_basic_block(f, "propagate.ok");
                 self.builder.build_conditional_branch(tag, eb, ok)?;
                 self.builder.position_at_end(eb);
-                self.emit_mir_cleanup()?;
+                self.emit_cleanup()?;
                 let rv = self
                     .builder
                     .build_extract_value(v, 2, "propagate.error.value")?;

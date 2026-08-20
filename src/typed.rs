@@ -27,12 +27,9 @@ impl ModuleId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalId(pub u32);
 
-/// Reserved for interned types and generic instantiations as those phases are
-/// migrated to structured identity.
+/// Structural identity used while specializing generic declarations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeId(pub u32);
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct InstantiationId(pub u32);
 
 impl DefId {
     pub fn index(self) -> usize {
@@ -95,38 +92,6 @@ impl ResolvedType {
     }
 }
 
-/// Interned structural types. Backends may use the resolved type directly,
-/// while caches and reflection use this identity to avoid string keys.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TypeInterner {
-    types: Vec<ResolvedType>,
-    ids: std::collections::HashMap<ResolvedType, TypeId>,
-}
-
-impl TypeInterner {
-    pub fn intern(&mut self, ty: ResolvedType) -> TypeId {
-        if let Some(id) = self.ids.get(&ty) {
-            return *id;
-        }
-        let id = TypeId(self.types.len() as u32);
-        self.ids.insert(ty.clone(), id);
-        self.types.push(ty);
-        id
-    }
-
-    pub fn get(&self, id: TypeId) -> Option<&ResolvedType> {
-        self.types.get(id.0 as usize)
-    }
-
-    pub fn len(&self) -> usize {
-        self.types.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.types.is_empty()
-    }
-}
-
 /// A structural key for a monomorphization. Linker names are deliberately not
 /// part of this key: they are derived only when a backend emits a symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -138,40 +103,14 @@ pub struct InstantiationKey {
 
 #[derive(Debug, Clone, Default)]
 pub struct InstantiationTable {
-    entries: Vec<InstantiationKey>,
-    ids: std::collections::HashMap<InstantiationKey, InstantiationId>,
-    queue: std::collections::VecDeque<InstantiationId>,
+    entries: std::collections::HashSet<InstantiationKey>,
 }
 
 impl InstantiationTable {
-    pub fn intern(&mut self, key: InstantiationKey) -> (InstantiationId, bool) {
-        if let Some(id) = self.ids.get(&key) {
-            return (*id, false);
-        }
-        let id = InstantiationId(self.entries.len() as u32);
-        self.ids.insert(key.clone(), id);
-        self.entries.push(key);
-        self.queue.push_back(id);
-        (id, true)
-    }
-
-    pub fn get(&self, id: InstantiationId) -> Option<&InstantiationKey> {
-        self.entries.get(id.0 as usize)
-    }
-
-    pub fn pop_pending(&mut self) -> Option<InstantiationId> {
-        self.queue.pop_front()
-    }
-
-    /// Number of structural instantiations which still need expansion.
-    pub fn pending_len(&self) -> usize {
-        self.queue.len()
-    }
-
-    /// Consume the work queue without exposing linker spellings. A frontend
-    /// can use this to drive recursive and mutually-dependent expansion.
-    pub fn drain_pending(&mut self) -> impl Iterator<Item = InstantiationId> + '_ {
-        std::iter::from_fn(|| self.pop_pending())
+    /// Record a structural specialization. The table is a set, rather than a
+    /// drained work queue: expansion itself is performed by the specializer.
+    pub fn intern(&mut self, key: InstantiationKey) -> bool {
+        self.entries.insert(key)
     }
 
     pub fn len(&self) -> usize {
@@ -275,8 +214,6 @@ impl SymbolTable {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProgram {
     pub symbols: SymbolTable,
-    /// Canonical structural type identities used by reflection and caches.
-    pub types: TypeInterner,
     pub structs: Vec<TypedStruct>,
     pub globals: Vec<TypedGlobal>,
     pub constants: Vec<TypedConstant>,

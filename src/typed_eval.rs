@@ -6,8 +6,9 @@
 //! operations return `NotConstant` instead of acquiring a second ad-hoc
 //! meaning.
 
-use crate::ast::{BinaryOp, UnaryOp};
-use crate::typed::{IntegerWidth, ResolvedType, TypedExpr};
+use crate::ast::BinaryOp;
+use crate::ops;
+use crate::typed::{ResolvedType, TypedExpr};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +46,7 @@ impl std::error::Error for Error {}
 /// no host-language fallback is performed.
 pub fn evaluate(expression: &TypedExpr) -> Result<Value, Error> {
     match expression {
-        TypedExpr::Integer { value, ty, .. } => Ok(Value::Integer(normalize(*value, ty))),
+        TypedExpr::Integer { value, ty, .. } => Ok(Value::Integer(ops::normalize(*value, ty))),
         TypedExpr::Float { value, .. } => Ok(Value::Float(*value)),
         TypedExpr::Bool { value, .. } => Ok(Value::Bool(*value)),
         TypedExpr::StructLiteral { fields, .. } => Ok(Value::Struct(
@@ -60,18 +61,8 @@ pub fn evaluate(expression: &TypedExpr) -> Result<Value, Error> {
             ty,
             ..
         } => {
-            let value = evaluate(operand)?;
-            match (operator, value) {
-                (UnaryOp::Negate, Value::Integer(value)) => {
-                    Ok(Value::Integer(normalize(value.wrapping_neg(), ty)))
-                }
-                (UnaryOp::Negate, Value::Float(value)) => Ok(Value::Float(-value)),
-                (UnaryOp::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
-                (UnaryOp::BitwiseNot, Value::Integer(value)) => {
-                    Ok(Value::Integer(normalize(!value, ty)))
-                }
-                _ => Err(Error::InvalidOperation),
-            }
+            let value = primitive(evaluate(operand)?);
+            from_primitive(ops::unary(*operator, value, ty).map_err(from_ops_error)?)
         }
         TypedExpr::Binary {
             left,
@@ -135,158 +126,43 @@ pub fn is_constant(expression: &TypedExpr) -> bool {
     evaluate(expression).is_ok()
 }
 
-fn bits(ty: &ResolvedType) -> (u32, bool) {
-    match ty {
-        ResolvedType::Integer {
-            width: IntegerWidth::Bits(bits),
-            signed,
-        } => (*bits as u32, *signed),
-        // Target-dependent pointer integers are kept exact in the typed
-        // evaluator. The target-aware layout evaluator owns their final width.
-        ResolvedType::Integer {
-            width: IntegerWidth::Pointer,
-            signed,
-        } => (128, *signed),
-        _ => (128, true),
-    }
-}
-fn normalize(value: i128, ty: &ResolvedType) -> i128 {
-    let (width, signed) = bits(ty);
-    if width >= 128 {
-        return value;
-    }
-    let mask = (1u128 << width) - 1;
-    let raw = (value as u128) & mask;
-    if signed && raw & (1u128 << (width - 1)) != 0 {
-        (raw | (!0u128 << width)) as i128
-    } else {
-        raw as i128
-    }
-}
-fn truth(value: &Value) -> Result<bool, Error> {
+fn primitive(value: Value) -> ops::Value {
     match value {
-        Value::Bool(value) => Ok(*value),
-        Value::Integer(value) => Ok(*value != 0),
-        _ => Err(Error::InvalidOperation),
+        Value::Bool(value) => ops::Value::Bool(value),
+        Value::Integer(value) => ops::Value::Integer(value),
+        Value::Float(value) => ops::Value::Float(value),
+        _ => unreachable!("aggregate is not a primitive operation"),
     }
 }
-fn binary(op: BinaryOp, left: Value, right: Value, ty: &ResolvedType) -> Result<Value, Error> {
-    match (left, right) {
-        (Value::Integer(a), Value::Integer(b)) => {
-            let (width, signed) = bits(ty);
-            let mask = if width >= 128 {
-                u128::MAX
-            } else {
-                (1u128 << width) - 1
-            };
-            let a_raw = (a as u128) & mask;
-            let b_raw = (b as u128) & mask;
-            let a_signed = normalize(a, ty);
-            let b_signed = normalize(b, ty);
-            let value = match op {
-                BinaryOp::Add => {
-                    Value::Integer(normalize((a_raw.wrapping_add(b_raw) & mask) as i128, ty))
-                }
-                BinaryOp::Subtract => {
-                    Value::Integer(normalize((a_raw.wrapping_sub(b_raw) & mask) as i128, ty))
-                }
-                BinaryOp::Multiply => {
-                    Value::Integer(normalize((a_raw.wrapping_mul(b_raw) & mask) as i128, ty))
-                }
-                BinaryOp::Divide
-                    if b_raw != 0 && !(signed && a_signed == i128::MIN && b_signed == -1) =>
-                {
-                    Value::Integer(normalize(
-                        if signed {
-                            a_signed / b_signed
-                        } else {
-                            (a_raw / b_raw) as i128
-                        },
-                        ty,
-                    ))
-                }
-                BinaryOp::Modulo
-                    if b_raw != 0 && !(signed && a_signed == i128::MIN && b_signed == -1) =>
-                {
-                    Value::Integer(normalize(
-                        if signed {
-                            a_signed % b_signed
-                        } else {
-                            (a_raw % b_raw) as i128
-                        },
-                        ty,
-                    ))
-                }
-                BinaryOp::Equal => Value::Bool(a_raw == b_raw),
-                BinaryOp::NotEqual => Value::Bool(a_raw != b_raw),
-                BinaryOp::Less => Value::Bool(if signed {
-                    a_signed < b_signed
-                } else {
-                    a_raw < b_raw
-                }),
-                BinaryOp::LessEqual => Value::Bool(if signed {
-                    a_signed <= b_signed
-                } else {
-                    a_raw <= b_raw
-                }),
-                BinaryOp::Greater => Value::Bool(if signed {
-                    a_signed > b_signed
-                } else {
-                    a_raw > b_raw
-                }),
-                BinaryOp::GreaterEqual => Value::Bool(if signed {
-                    a_signed >= b_signed
-                } else {
-                    a_raw >= b_raw
-                }),
-                BinaryOp::BitwiseAnd => Value::Integer(normalize((a_raw & b_raw) as i128, ty)),
-                BinaryOp::BitwiseOr => Value::Integer(normalize((a_raw | b_raw) as i128, ty)),
-                BinaryOp::BitwiseXor => Value::Integer(normalize((a_raw ^ b_raw) as i128, ty)),
-                BinaryOp::ShiftLeft if b_raw < width as u128 => {
-                    Value::Integer(normalize((a_raw << b_raw) as i128, ty))
-                }
-                BinaryOp::ShiftRight if b_raw < width as u128 => Value::Integer(normalize(
-                    if signed {
-                        a_signed >> b_raw
-                    } else {
-                        (a_raw >> b_raw) as i128
-                    },
-                    ty,
-                )),
-                BinaryOp::Divide | BinaryOp::Modulo => return Err(Error::DivisionByZero),
-                _ => return Err(Error::InvalidOperation),
-            };
-            Ok(value)
-        }
-        (Value::Float(a), Value::Float(b)) => Ok(match op {
-            BinaryOp::Add => Value::Float(a + b),
-            BinaryOp::Subtract => Value::Float(a - b),
-            BinaryOp::Multiply => Value::Float(a * b),
-            BinaryOp::Divide => Value::Float(a / b),
-            BinaryOp::Modulo => Value::Float(a % b),
-            BinaryOp::Equal => Value::Bool(a == b),
-            BinaryOp::NotEqual => Value::Bool(a != b),
-            BinaryOp::Less => Value::Bool(a < b),
-            BinaryOp::LessEqual => Value::Bool(a <= b),
-            BinaryOp::Greater => Value::Bool(a > b),
-            BinaryOp::GreaterEqual => Value::Bool(a >= b),
-            _ => return Err(Error::InvalidOperation),
-        }),
-        (Value::Bool(a), Value::Bool(b)) => Ok(match op {
-            BinaryOp::Equal => Value::Bool(a == b),
-            BinaryOp::NotEqual => Value::Bool(a != b),
-            BinaryOp::LogicalAnd => Value::Bool(a && b),
-            BinaryOp::LogicalOr => Value::Bool(a || b),
-            _ => return Err(Error::InvalidOperation),
-        }),
-        _ => Err(Error::InvalidOperation),
+
+fn from_primitive(value: ops::Value) -> Result<Value, Error> {
+    Ok(match value {
+        ops::Value::Bool(value) => Value::Bool(value),
+        ops::Value::Integer(value) => Value::Integer(value),
+        ops::Value::Float(value) => Value::Float(value),
+    })
+}
+
+fn from_ops_error(error: ops::Error) -> Error {
+    match error {
+        ops::Error::DivisionByZero => Error::DivisionByZero,
+        ops::Error::InvalidOperation => Error::InvalidOperation,
     }
+}
+
+fn truth(value: &Value) -> Result<bool, Error> {
+    ops::truth(primitive(value.clone())).map_err(from_ops_error)
+}
+
+fn binary(op: BinaryOp, left: Value, right: Value, ty: &ResolvedType) -> Result<Value, Error> {
+    from_primitive(ops::binary(op, primitive(left), primitive(right), ty).map_err(from_ops_error)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lexer::Span;
+    use crate::typed::IntegerWidth;
 
     fn i32_value(value: i128) -> TypedExpr {
         TypedExpr::Integer {

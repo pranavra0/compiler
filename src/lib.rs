@@ -6,6 +6,7 @@ pub mod interpreter;
 pub mod lexer;
 pub mod mir;
 pub mod modules;
+pub mod ops;
 pub mod parser;
 pub mod pipeline;
 pub mod semantic;
