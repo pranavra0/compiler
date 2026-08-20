@@ -1,8 +1,10 @@
-//! Deterministic source-module loading and the small first-generation linker IR.
+//! Deterministic source-module loading and module identity resolution.
 //!
-//! The resolver deliberately flattens a module graph after resolving it.  The
-//! language IR is still module independent, while private implementation names
-//! cannot collide: declarations from `math.compy` become `math__name`.
+//! The graph is resolved by canonical path and every module/declaration gets a
+//! compiler-owned identity.  The legacy `Program` returned by this module is a
+//! compatibility view for the current frontend; its private names are derived
+//! from those identities rather than from file-stem prefix rewriting.  The
+//! graph and its declaration metadata are the authoritative representation.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -11,14 +13,119 @@ use std::path::{Path, PathBuf};
 use crate::ast::*;
 use crate::lexer::Span;
 use crate::pipeline;
+use crate::typed::{DefId, DefinitionKind, ModuleId, TypedProgram};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDefinition {
+    pub id: DefId,
+    pub module: ModuleId,
+    /// Name as written in the declaring source file.
+    pub source_name: String,
+    /// Backend/linker spelling. This is metadata, not a name used for lookup.
+    pub linker_name: String,
+    pub kind: DefinitionKind,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleImport {
+    pub alias: String,
+    pub target: ModuleId,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleInfo {
+    pub id: ModuleId,
+    pub path: PathBuf,
+    pub imports: Vec<ModuleImport>,
+    pub declarations: Vec<DefId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraph {
+    pub root: ModuleId,
+    pub modules: Vec<ModuleInfo>,
+    pub definitions: Vec<ModuleDefinition>,
+}
+
+impl ModuleGraph {
+    pub fn module(&self, id: ModuleId) -> Option<&ModuleInfo> {
+        self.modules
+            .get(id.index())
+            .filter(|module| module.id == id)
+    }
+
+    pub fn definition(&self, id: DefId) -> Option<&ModuleDefinition> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.id == id)
+    }
+
+    pub fn lookup(&self, module: ModuleId, name: &str) -> Option<&ModuleDefinition> {
+        let module = self.module(module)?;
+        module
+            .declarations
+            .iter()
+            .filter_map(|id| self.definition(*id))
+            .find(|definition| definition.source_name == name)
+    }
+
+    pub fn import(&self, module: ModuleId, alias: &str) -> Option<ModuleId> {
+        self.module(module)?
+            .imports
+            .iter()
+            .find(|import| import.alias == alias)
+            .map(|import| import.target)
+    }
+
+    pub fn lookup_qualified(
+        &self,
+        module: ModuleId,
+        alias: &str,
+        name: &str,
+    ) -> Option<&ModuleDefinition> {
+        let target = self.import(module, alias)?;
+        self.lookup(target, name)
+    }
+
+    /// Resolve a qualified source spelling without deriving a linker name.
+    /// Backends should carry the returned ID and consult `definition` only
+    /// when they need presentation or linkage metadata.
+    pub fn resolve_qualified(&self, module: ModuleId, alias: &str, name: &str) -> Option<DefId> {
+        self.lookup_qualified(module, alias, name)
+            .map(|definition| definition.id)
+    }
+
+    pub fn resolve_local(&self, module: ModuleId, name: &str) -> Option<DefId> {
+        self.lookup(module, name).map(|definition| definition.id)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Project {
+    /// Compatibility AST consumed by the pre-MIR frontend. Resolution and
+    /// identity information lives in `graph`; this field is not the module
+    /// graph itself.
     pub program: Program,
+    pub graph: ModuleGraph,
     pub root_source: String,
     pub root_path: PathBuf,
     /// Canonical source files in deterministic dependency order.
     pub dependencies: Vec<PathBuf>,
+}
+
+impl Project {
+    /// Analyze the resolved project through its canonical graph entry point.
+    /// The compatibility AST is an implementation boundary; callers no
+    /// longer need to know how module source is assembled.
+    pub fn analyze(&self, pointer_width: u32) -> Result<TypedProgram, pipeline::FrontendError> {
+        pipeline::analyze_program_with_pointer_width(&self.program, pointer_width)
+    }
+
+    pub fn analyze_native(&self) -> Result<TypedProgram, pipeline::FrontendError> {
+        self.analyze(usize::BITS)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,12 +143,18 @@ impl std::error::Error for ProjectError {}
 struct Node {
     path: PathBuf,
     program: Program,
-    prefix: String,
-    aliases: HashMap<String, String>,
+    is_root: bool,
+    /// Imports point at graph nodes, never at a derived string prefix.
+    aliases: HashMap<String, usize>,
     visible_exports: HashMap<String, HashSet<String>>,
-    /// Names explicitly exported by this module. Visibility is checked before
-    /// flattening so imported access remains qualified and deterministic.
+    /// Names explicitly exported by this module.
     exported: HashSet<String>,
+    module_id: ModuleId,
+    declaration_ids: HashMap<String, DefId>,
+    /// Temporary compatibility spellings for the old AST frontend. All of
+    /// these are derived from `module_id`/`DefId`; lookup uses graph identity.
+    linker_names: HashMap<String, String>,
+    alias_linker_names: HashMap<String, HashMap<String, String>>,
 }
 
 pub fn resolve(root: impl AsRef<Path>, module_roots: &[PathBuf]) -> Result<Project, ProjectError> {
@@ -53,7 +166,7 @@ pub fn resolve(root: impl AsRef<Path>, module_roots: &[PathBuf]) -> Result<Proje
     let mut nodes = Vec::<Node>::new();
     let mut indexes = HashMap::<PathBuf, usize>::new();
     let mut visiting = Vec::<PathBuf>::new();
-    visit(
+    let root_index = visit(
         &root,
         true,
         module_roots,
@@ -63,23 +176,118 @@ pub fn resolve(root: impl AsRef<Path>, module_roots: &[PathBuf]) -> Result<Proje
         Span::new(0, 0),
     )?;
 
+    // Assign identities only after traversal. Post-order traversal makes the
+    // IDs deterministic and ensures dependencies precede their users.
+    let mut next_def = 0u32;
+    for (module_index, node) in nodes.iter_mut().enumerate() {
+        node.module_id = ModuleId(module_index as u32);
+        for declaration in &node.program.declarations {
+            let Some(name) = declaration_name(declaration) else {
+                continue;
+            };
+            let id = DefId(next_def);
+            next_def += 1;
+            node.declaration_ids.insert(name.to_string(), id);
+            let linker_name = if node.is_root {
+                name.to_string()
+            } else {
+                format!("__module_{}_{}", node.module_id.0, name)
+            };
+            node.linker_names.insert(name.to_string(), linker_name);
+        }
+    }
+    for node_index in 0..nodes.len() {
+        let aliases = nodes[node_index].aliases.clone();
+        for (alias, target_index) in aliases {
+            let target_names = nodes[target_index].linker_names.clone();
+            nodes[node_index]
+                .alias_linker_names
+                .insert(alias, target_names);
+        }
+    }
+
     for node in &nodes {
         for declaration in &node.program.declarations {
             validate_visibility(declaration, node)?;
         }
     }
     let mut declarations = Vec::new();
-    // Dependencies are emitted before users.  Function/type collection is
-    // nevertheless two-pass, so this ordering is only for readable IR.
+    // The AST frontend still needs one declaration list. This is a boundary
+    // adapter only: names are generated from graph identities and all source
+    // names/linker names remain available in `graph`.
     for node in &nodes {
         for declaration in &node.program.declarations {
             declarations.push(rewrite_decl(declaration, node));
         }
     }
+    let definitions = nodes
+        .iter()
+        .flat_map(|node| {
+            node.program.declarations.iter().filter_map(|declaration| {
+                let name = declaration_name(declaration)?;
+                let id = node.declaration_ids[name];
+                let (kind, exported, explicit_linker) = match declaration {
+                    Decl::Function(f) => {
+                        (DefinitionKind::Function, f.exported, f.link_name.clone())
+                    }
+                    Decl::Struct(s) => (DefinitionKind::Struct, s.exported, None),
+                    Decl::Variable(v) => (
+                        if matches!(v.kind, VariableKind::Immutable) {
+                            DefinitionKind::Constant
+                        } else {
+                            DefinitionKind::Global
+                        },
+                        v.exported,
+                        None,
+                    ),
+                    Decl::Comptime { .. } => return None,
+                };
+                Some(ModuleDefinition {
+                    id,
+                    module: node.module_id,
+                    source_name: name.to_string(),
+                    linker_name: explicit_linker.unwrap_or_else(|| node.linker_names[name].clone()),
+                    kind,
+                    exported,
+                })
+            })
+        })
+        .collect();
+    let modules = nodes
+        .iter()
+        .map(|node| ModuleInfo {
+            id: node.module_id,
+            path: node.path.clone(),
+            imports: node
+                .program
+                .imports
+                .iter()
+                .filter_map(|import| {
+                    Some(ModuleImport {
+                        alias: import.alias.clone(),
+                        target: ModuleId(*node.aliases.get(&import.alias)? as u32),
+                        span: import.span,
+                    })
+                })
+                .collect(),
+            declarations: node
+                .program
+                .declarations
+                .iter()
+                .filter_map(|declaration| declaration_name(declaration))
+                .filter_map(|name| node.declaration_ids.get(name).copied())
+                .collect(),
+        })
+        .collect();
     Ok(Project {
         program: Program {
             imports: Vec::new(),
             declarations,
+        },
+        graph: ModuleGraph {
+            root: ModuleId(root_index as u32),
+            modules,
+            definitions,
         },
         root_source,
         root_path: root,
@@ -121,14 +329,6 @@ fn visit(
         message: format!("in module `{}`: {e}", path.display()),
         span: e.span(),
     })?;
-    let prefix = if is_root {
-        String::new()
-    } else {
-        path.file_stem()
-            .and_then(|x| x.to_str())
-            .unwrap_or("module")
-            .replace('-', "_")
-    };
     let exported = program
         .declarations
         .iter()
@@ -158,9 +358,8 @@ fn visit(
             visiting,
             import.span,
         )?;
-        let imported_prefix = nodes[imported_index].prefix.clone();
         let imported_exports = nodes[imported_index].exported.clone();
-        aliases.insert(import.alias.clone(), imported_prefix);
+        aliases.insert(import.alias.clone(), imported_index);
         visible_exports.insert(import.alias.clone(), imported_exports);
     }
     visiting.pop();
@@ -169,10 +368,14 @@ fn visit(
     nodes.push(Node {
         path,
         program,
-        prefix,
+        is_root,
         aliases,
         visible_exports,
         exported,
+        module_id: ModuleId(u32::MAX),
+        declaration_ids: HashMap::new(),
+        linker_names: HashMap::new(),
+        alias_linker_names: HashMap::new(),
     });
     Ok(index)
 }
@@ -414,26 +617,15 @@ fn validate_expr_visibility(expr: &Expr, node: &Node) -> Result<(), ProjectError
     Ok(())
 }
 
-fn prefixed(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.into()
-    } else {
-        format!("{prefix}__{name}")
+fn declaration_name(decl: &Decl) -> Option<&str> {
+    match decl {
+        Decl::Function(f) => Some(&f.name),
+        Decl::Struct(s) => Some(&s.name),
+        Decl::Variable(v) => Some(&v.name),
+        Decl::Comptime { .. } => None,
     }
 }
 
-fn local_names(node: &Node) -> HashSet<String> {
-    node.program
-        .declarations
-        .iter()
-        .filter_map(|d| match d {
-            Decl::Function(x) => Some(x.name.clone()),
-            Decl::Variable(x) => Some(x.name.clone()),
-            Decl::Struct(x) => Some(x.name.clone()),
-            Decl::Comptime { .. } => None,
-        })
-        .collect()
-}
 fn local_structs(node: &Node) -> HashSet<String> {
     node.program
         .declarations
@@ -448,15 +640,19 @@ fn map_name(node: &Node, name: &str, bound: &HashSet<String>) -> String {
     if bound.contains(name) {
         return name.into();
     }
-    if local_names(node).contains(name) {
-        prefixed(&node.prefix, name)
-    } else {
-        name.into()
-    }
+    node.linker_names
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.into())
 }
 fn map_type(node: &Node, ty: &Type) -> Type {
     match ty {
-        Type::Named(n) if local_structs(node).contains(n) => Type::Named(prefixed(&node.prefix, n)),
+        Type::Named(n) if local_structs(node).contains(n) => Type::Named(
+            node.linker_names
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| n.clone()),
+        ),
         Type::Named(n) if n.contains('.') => {
             let (alias, name) = n.split_once('.').unwrap();
 
@@ -470,10 +666,13 @@ fn map_type(node: &Node, ty: &Type) -> Type {
                 // spelling here instead of manufacturing a sentinel name.
                 Type::Named(format!("{alias}.{name}"))
             } else {
-                Type::Named(prefixed(
-                    node.aliases.get(alias).map(String::as_str).unwrap_or(alias),
-                    name,
-                ))
+                Type::Named(
+                    node.alias_linker_names
+                        .get(alias)
+                        .and_then(|names| names.get(name))
+                        .cloned()
+                        .unwrap_or_else(|| format!("{alias}.{name}")),
+                )
             }
         }
         Type::Named(n) => Type::Named(n.clone()),
@@ -494,7 +693,7 @@ fn map_type(node: &Node, ty: &Type) -> Type {
 fn rewrite_decl(decl: &Decl, node: &Node) -> Decl {
     match decl {
         Decl::Struct(s) => Decl::Struct(StructDecl {
-            name: prefixed(&node.prefix, &s.name),
+            name: node.linker_names[&s.name].clone(),
             generic_params: s.generic_params.clone(),
             fields: s
                 .fields
@@ -511,7 +710,7 @@ fn rewrite_decl(decl: &Decl, node: &Node) -> Decl {
         Decl::Variable(v) => {
             let bound = HashSet::new();
             Decl::Variable(VariableDecl {
-                name: prefixed(&node.prefix, &v.name),
+                name: node.linker_names[&v.name].clone(),
                 kind: v.kind,
                 ty: v.ty.as_ref().map(|t| map_type(node, t)),
                 value: rewrite_expr(&v.value, node, &bound),
@@ -527,7 +726,7 @@ fn rewrite_decl(decl: &Decl, node: &Node) -> Decl {
                 .collect::<HashSet<_>>();
             let body = rewrite_block(&f.body, node, &mut bound);
             Decl::Function(FunctionDecl {
-                name: prefixed(&node.prefix, &f.name),
+                name: node.linker_names[&f.name].clone(),
                 generic_params: f.generic_params.clone(),
                 params: f
                     .params
@@ -646,7 +845,7 @@ fn rewrite_expr(expr: &Expr, node: &Node, bound: &HashSet<String>) -> Expr {
         },
         Expr::Field { base, name, .. } => {
             if let Expr::Identifier { name: alias, .. } = base.as_ref()
-                && let Some(prefix) = node.aliases.get(alias)
+                && node.aliases.contains_key(alias)
             {
                 let visible = node
                     .visible_exports
@@ -654,11 +853,15 @@ fn rewrite_expr(expr: &Expr, node: &Node, bound: &HashSet<String>) -> Expr {
                     .map(|names| names.contains(name))
                     .unwrap_or(false);
                 let name = if visible {
-                    prefixed(prefix, name)
+                    node.alias_linker_names
+                        .get(alias)
+                        .and_then(|names| names.get(name))
+                        .cloned()
+                        .unwrap_or_else(|| format!("{alias}.{name}"))
                 } else {
                     // `validate_visibility` normally rejects this path.
                     // Preserve the source identity if it is reached rather
-                    // than inventing a private-name sentinel.
+                    // than manufacturing a private-name sentinel.
                     format!("{alias}.{name}")
                 };
                 return Expr::Identifier { name, span };
@@ -756,18 +959,19 @@ fn rewrite_expr(expr: &Expr, node: &Node, bound: &HashSet<String>) -> Expr {
     }
 }
 fn map_type_name(node: &Node, name: &str) -> String {
-    if name.contains('.') {
-        let mut p = name.splitn(2, '.');
-        return prefixed(
-            node.aliases
-                .get(p.next().unwrap())
-                .map(String::as_str)
-                .unwrap_or(""),
-            p.next().unwrap(),
-        );
+    if let Some((alias, item)) = name.split_once('.') {
+        return node
+            .alias_linker_names
+            .get(alias)
+            .and_then(|names| names.get(item))
+            .cloned()
+            .unwrap_or_else(|| name.into());
     }
     if local_structs(node).contains(name) {
-        prefixed(&node.prefix, name)
+        node.linker_names
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.into())
     } else {
         name.into()
     }

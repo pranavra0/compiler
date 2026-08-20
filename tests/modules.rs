@@ -1,3 +1,4 @@
+use compiler::modules;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -48,6 +49,43 @@ fn qualified_imports_and_exports_build() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(Command::new(&output).status().unwrap().code(), Some(5));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn module_graph_exposes_stable_module_and_declaration_identities() {
+    let dir = temp_dir("graph");
+    fs::write(
+        dir.join("lib.compy"),
+        "export first :: () -> i32 { return 1; } export second :: () -> i32 { return 2; }",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.compy"),
+        "import lib; main :: () -> i32 { return lib.first() + lib.second(); }",
+    )
+    .unwrap();
+
+    let project = modules::resolve(dir.join("main.compy"), &[]).unwrap();
+    assert_eq!(project.graph.modules.len(), 2);
+    assert_eq!(project.graph.root, project.graph.modules[1].id);
+    assert_eq!(project.graph.modules[0].imports.len(), 0);
+    assert_eq!(
+        project.graph.modules[1].imports[0].target,
+        project.graph.modules[0].id
+    );
+    assert_eq!(project.graph.definitions.len(), 3);
+    assert_eq!(
+        project
+            .graph
+            .definitions
+            .iter()
+            .map(|definition| definition.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        project.graph.definitions.len()
+    );
+    assert!(project.graph.definitions[0].module != project.graph.root);
     fs::remove_dir_all(dir).unwrap();
 }
 

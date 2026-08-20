@@ -9,6 +9,7 @@ use std::fmt;
 
 use crate::ast::{BinaryOp, Block, Decl, Expr, FunctionDecl, Program, Stmt, Type, UnaryOp};
 use crate::lexer::Span;
+use crate::typed::{DefId, InstantiationKey, InstantiationTable, TypeId};
 
 const DEFAULT_STEP_LIMIT: u64 = 100_000;
 const DEFAULT_RECURSION_LIMIT: usize = 128;
@@ -198,8 +199,14 @@ fn specialize_program(program: &Program) -> Result<Program, Error> {
 struct Specializer<'a> {
     generic: HashMap<String, &'a FunctionDecl>,
     generic_structs: HashMap<String, &'a crate::ast::StructDecl>,
+    generic_ids: HashMap<String, DefId>,
+    generic_struct_ids: HashMap<String, DefId>,
     generated: HashMap<String, FunctionDecl>,
     generated_structs: HashMap<String, crate::ast::StructDecl>,
+    /// Structural instantiation identities drive the work queue. Mangled
+    /// names remain only as the source-level compatibility spelling.
+    instantiations: InstantiationTable,
+    type_ids: HashMap<Type, TypeId>,
 }
 impl<'a> Specializer<'a> {
     fn new(program: &'a Program) -> Self {
@@ -210,7 +217,7 @@ impl<'a> Specializer<'a> {
                 Decl::Function(f) if !f.generic_params.is_empty() => Some((f.name.clone(), f)),
                 _ => None,
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
         let generic_structs = program
             .declarations
             .iter()
@@ -218,13 +225,85 @@ impl<'a> Specializer<'a> {
                 Decl::Struct(s) if !s.generic_params.is_empty() => Some((s.name.clone(), s)),
                 _ => None,
             })
+            .collect::<HashMap<_, _>>();
+        let generic_ids = program
+            .declarations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, declaration)| match declaration {
+                Decl::Function(function) if !function.generic_params.is_empty() => {
+                    Some((function.name.clone(), DefId(index as u32)))
+                }
+                _ => None,
+            })
+            .collect();
+        let generic_struct_ids = program
+            .declarations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, declaration)| match declaration {
+                Decl::Struct(structure) if !structure.generic_params.is_empty() => {
+                    Some((structure.name.clone(), DefId(index as u32)))
+                }
+                _ => None,
+            })
             .collect();
         Self {
             generic,
             generic_structs,
+            generic_ids,
+            generic_struct_ids,
             generated: HashMap::new(),
             generated_structs: HashMap::new(),
+            instantiations: InstantiationTable::default(),
+            type_ids: HashMap::new(),
         }
+    }
+
+    fn type_id(&mut self, ty: &Type) -> TypeId {
+        if let Some(id) = self.type_ids.get(ty) {
+            return *id;
+        }
+        // Type IDs are local to this specialization session and are keyed by
+        // the structural AST type itself. A linker spelling can never merge
+        // distinct types (or split equivalent nested types).
+        let id = TypeId(self.type_ids.len() as u32);
+        self.type_ids.insert(ty.clone(), id);
+        id
+    }
+
+    fn register_instantiation(
+        &mut self,
+        name: &str,
+        substitutions: &HashMap<String, Type>,
+        parameters: &[crate::ast::GenericParam],
+        span: Span,
+    ) -> Result<bool, Error> {
+        let Some(definition) = self
+            .generic_ids
+            .get(name)
+            .copied()
+            .or_else(|| self.generic_struct_ids.get(name).copied())
+        else {
+            return Ok(true);
+        };
+        let type_arguments = parameters
+            .iter()
+            .filter_map(|parameter| substitutions.get(&parameter.name))
+            .map(|ty| self.type_id(ty))
+            .collect();
+        let (_, fresh) = self.instantiations.intern(InstantiationKey {
+            definition,
+            type_arguments,
+            value_arguments: Vec::new(),
+        });
+        if !fresh && self.instantiations.len() > MAX_SPECIALIZATIONS {
+            return Err(Error::InvalidOperation {
+                message: "generic specialization limit exceeded".into(),
+                span,
+            });
+        }
+        Ok(fresh)
     }
     fn specialize_type(&mut self, ty: &Type, span: Span) -> Result<Type, Error> {
         match ty {
@@ -284,6 +363,9 @@ impl<'a> Specializer<'a> {
         let mut substitutions = HashMap::new();
         for (parameter, part) in structure.generic_params.iter().zip(parts) {
             substitutions.insert(parameter.name.clone(), demangle_type(part));
+        }
+        if !self.register_instantiation(base, &substitutions, &structure.generic_params, span)? {
+            return Ok(());
         }
         let mut specialized = structure.clone();
         specialized.name = name.into();
@@ -363,6 +445,9 @@ impl<'a> Specializer<'a> {
                 message: "generic specialization limit exceeded".into(),
                 span,
             });
+        }
+        if !self.register_instantiation(name, &substitutions, &function.generic_params, span)? {
+            return Ok(specialized_name);
         }
         let mut specialized = function.clone();
         specialized.name = specialized_name.clone();

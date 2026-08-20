@@ -158,7 +158,8 @@ fn run_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(arguments)?;
     let project = project(filename, arguments)?;
     let pointer_width = pointer_width_for(&options)?;
-    let typed = pipeline::analyze_program_with_pointer_width(&project.program, pointer_width)
+    let typed = project
+        .analyze(pointer_width)
         .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let status = interpreter::run_with_pointer_width(&typed, pointer_width)
         .map_err(|error| format!("interpreter error: {error}"))?;
@@ -221,7 +222,8 @@ fn project(filename: &str, arguments: &[String]) -> Result<modules::Project, Str
 fn check_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(arguments)?;
     let project = project(filename, arguments)?;
-    pipeline::analyze_program_with_pointer_width(&project.program, pointer_width_for(&options)?)
+    project
+        .analyze(pointer_width_for(&options)?)
         .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     println!("semantic analysis succeeded");
     Ok(())
@@ -230,11 +232,9 @@ fn check_command(filename: &str, arguments: &[String]) -> Result<(), String> {
 fn ir_command(filename: &str, arguments: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(arguments)?;
     let project = project(filename, arguments)?;
-    let typed = pipeline::analyze_program_with_pointer_width(
-        &project.program,
-        pointer_width_for(&options)?,
-    )
-    .map_err(|error| frontend_error(filename, &project.root_source, error))?;
+    let typed = project
+        .analyze(pointer_width_for(&options)?)
+        .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let context = Context::create();
     let module = if options.target.is_some() {
         Target::initialize_all(&InitializationConfig::default());
@@ -351,11 +351,9 @@ fn build_command(filename: &str, arguments: &[String]) -> Result<(), String> {
             frontend_error(filename, &project.root_source, frontend)
         })?;
     }
-    let typed = pipeline::analyze_program_with_pointer_width(
-        &project.program,
-        target_data.get_pointer_byte_size(None) * 8,
-    )
-    .map_err(|error| frontend_error(filename, &project.root_source, error))?;
+    let typed = project
+        .analyze(target_data.get_pointer_byte_size(None) * 8)
+        .map_err(|error| frontend_error(filename, &project.root_source, error))?;
     let context = Context::create();
     let generator = CodeGenerator::with_target_data(&context, module_name(&output), &target_data);
     let generator = if options.debug {

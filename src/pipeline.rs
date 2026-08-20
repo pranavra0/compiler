@@ -3,6 +3,7 @@ use std::fmt;
 use crate::ast::Program;
 use crate::comptime;
 use crate::lexer::{LexError, Lexer, Span, Token, TokenKind};
+use crate::mir::{MirError, MirProgram};
 use crate::parser::{ParseError, Parser};
 use crate::semantic::{self, SemanticError};
 use crate::typed::TypedProgram;
@@ -13,6 +14,7 @@ pub enum FrontendError {
     Parser(ParseError),
     Semantic(SemanticError),
     Comptime(comptime::Error),
+    Mir(MirError),
 }
 
 impl FrontendError {
@@ -22,6 +24,7 @@ impl FrontendError {
             Self::Parser(_) => "parser",
             Self::Semantic(_) => "semantic",
             Self::Comptime(_) => "comptime",
+            Self::Mir(_) => "mir",
         }
     }
 
@@ -42,6 +45,7 @@ impl FrontendError {
             },
             Self::Semantic(error) => error.span(),
             Self::Comptime(error) => error.span(),
+            Self::Mir(error) => error.span(),
         }
     }
 }
@@ -64,6 +68,7 @@ impl FrontendError {
             Self::Parser(error) => error.to_string(),
             Self::Semantic(error) => error.to_string(),
             Self::Comptime(error) => error.to_string(),
+            Self::Mir(error) => error.to_string(),
         }
     }
 }
@@ -109,6 +114,21 @@ pub fn analyze_program_with_pointer_width(
 pub fn analyze_source(source: &str) -> Result<TypedProgram, FrontendError> {
     let program = parse_source(source)?;
     analyze_program(&program)
+}
+
+/// Lower a validated typed program to the shared control-flow representation.
+/// Keeping this as a pipeline entry point prevents individual backends from
+/// inventing their own structured-control-flow lowering.
+pub fn lower_mir(program: &Program) -> Result<MirProgram, FrontendError> {
+    let typed = analyze_program(program)?;
+    lower_typed_mir(&typed)
+}
+
+/// Lower an already validated program without re-running expansion or name
+/// resolution. Backends and tools should use this entry point when they have
+/// already selected a typed frontend result.
+pub fn lower_typed_mir(program: &TypedProgram) -> Result<MirProgram, FrontendError> {
+    MirProgram::lower(program).map_err(FrontendError::Mir)
 }
 
 #[cfg(test)]

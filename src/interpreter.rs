@@ -4,9 +4,9 @@
 //! quick experiments. Operations which need a native address or an FFI symbol
 //! are rejected instead of being silently emulated.
 use crate::ast::{BinaryOp, UnaryOp};
+use crate::mir::{MirInstruction, MirProgram, MirTerminator};
 use crate::typed::{
-    DefId, FunctionId, IntegerWidth, LocalId, ResolvedType, TypedBlock, TypedExpr, TypedPlace,
-    TypedProgram, TypedStmt,
+    DefId, FunctionId, IntegerWidth, LocalId, ResolvedType, TypedExpr, TypedPlace, TypedProgram,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -38,13 +38,6 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-enum Flow {
-    Normal,
-    Return(Value),
-    Break,
-    Continue,
-}
-
 type Env = HashMap<LocalId, Value>;
 type Globals = HashMap<DefId, Value>;
 
@@ -56,6 +49,8 @@ pub fn run_with_pointer_width(program: &TypedProgram, pointer_bits: u32) -> Resu
     POINTER_BITS.store(pointer_bits, Ordering::Relaxed);
     STEPS.store(0, Ordering::Relaxed);
     CALL_DEPTH.store(0, Ordering::Relaxed);
+    let mir = MirProgram::lower(program)
+        .map_err(|error| Error(format!("MIR lowering failed: {error}")))?;
     let mut globals = HashMap::new();
     for global in &program.globals {
         let value = eval_expr(program, &mut globals, &mut HashMap::new(), &global.value)?;
@@ -70,7 +65,7 @@ pub fn run_with_pointer_width(program: &TypedProgram, pointer_bits: u32) -> Resu
         .iter()
         .find(|f| f.name == "main" && !f.is_extern)
         .ok_or_else(|| Error("interpreter requires a source `main` function".into()))?;
-    let value = call(program, &mut globals, main.id, Vec::new())?;
+    let value = call_mir(program, &mir, &mut globals, main.id, Vec::new())?;
     match value {
         Value::Unit => Ok(0),
         Value::Int(x) => Ok(x as i32),
@@ -92,8 +87,9 @@ impl Drop for CallGuard {
     }
 }
 
-fn call(
+fn call_mir(
     program: &TypedProgram,
+    mir: &MirProgram,
     globals: &mut Globals,
     id: FunctionId,
     args: Vec<Value>,
@@ -103,139 +99,143 @@ fn call(
         return Err(Error("interpreter call-depth limit exceeded".into()));
     }
     let _guard = CallGuard;
-    let f = function(program, id)?;
-    if f.is_extern {
+    let typed = function(program, id)?;
+    if typed.is_extern {
         return Err(Error(format!(
             "interpreter does not support foreign function `{}`",
-            f.name
+            typed.name
         )));
     }
-    if f.params.len() != args.len() {
-        return Err(Error(format!("wrong number of arguments to `{}`", f.name)));
+    let mir_function = mir
+        .function(id)
+        .ok_or_else(|| Error(format!("unknown MIR function id {id}")))?;
+    if mir_function.params.len() != args.len() {
+        return Err(Error(format!(
+            "wrong number of arguments to `{}`",
+            typed.name
+        )));
     }
     let mut env = Env::new();
-    for (p, value) in f.params.iter().zip(args) {
-        env.insert(p.id, value);
+    for (parameter, value) in mir_function.params.iter().zip(args) {
+        env.insert(parameter.id, value);
     }
-    match block(program, globals, &mut env, &f.body)? {
-        Flow::Return(v) => Ok(v),
-        Flow::Normal => Ok(Value::Unit),
-        Flow::Break | Flow::Continue => Err(Error(format!("loop control escaped `{}`", f.name))),
+    let mut block_id = mir_function.entry;
+    loop {
+        consume_step()?;
+        let block = mir_function
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .ok_or_else(|| Error(format!("unknown MIR block {}", block_id.0)))?;
+        for instruction in &block.instructions {
+            match instruction {
+                MirInstruction::Declare { id, value, .. } => {
+                    let evaluated = eval_expr(program, globals, &mut env, value)?;
+                    if matches!(value, TypedExpr::Propagate { .. }) {
+                        match evaluated {
+                            Value::Result { error: true, .. } => {
+                                let actions = mir_function
+                                    .cleanup
+                                    .get(&block.id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                run_cleanup(program, globals, &mut env, &actions)?;
+                                return Ok(evaluated);
+                            }
+                            Value::Result { value, .. } => {
+                                env.insert(*id, *value);
+                            }
+                            other => {
+                                env.insert(*id, other);
+                            }
+                        }
+                    } else {
+                        env.insert(*id, evaluated);
+                    }
+                }
+                MirInstruction::Store { target, value, .. } => {
+                    let evaluated = eval_expr(program, globals, &mut env, value)?;
+                    store(program, globals, &mut env, target, evaluated)?;
+                }
+                MirInstruction::Expr { expression, .. } => {
+                    eval_expr(program, globals, &mut env, expression)?;
+                }
+                MirInstruction::RunDefers { actions, .. } => {
+                    for action in actions {
+                        let values = action
+                            .arguments
+                            .iter()
+                            .map(|argument| eval_expr(program, globals, &mut env, argument))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let _ = call(program, globals, action.function, values)?;
+                    }
+                }
+                MirInstruction::ScopeEnter | MirInstruction::ScopeExit => unreachable!(),
+            }
+        }
+        match &block.terminator {
+            MirTerminator::Jump(target) => block_id = *target,
+            MirTerminator::Branch {
+                condition,
+                then_block,
+                else_block,
+                ..
+            } => {
+                block_id = if truth(&eval_expr(program, globals, &mut env, condition)?)? {
+                    *then_block
+                } else {
+                    *else_block
+                };
+            }
+            MirTerminator::Return(value) => {
+                return match value {
+                    Some(value) => Ok(eval_expr(program, globals, &mut env, value)?),
+                    None => Ok(Value::Unit),
+                };
+            }
+            MirTerminator::Unreachable => {
+                return Err(Error("reached MIR unreachable terminator".into()));
+            }
+        }
     }
 }
-fn block(
+
+fn run_cleanup(
     program: &TypedProgram,
     globals: &mut Globals,
     env: &mut Env,
-    b: &TypedBlock,
-) -> Result<Flow, Error> {
-    let mut defers: Vec<(FunctionId, Vec<Value>)> = Vec::new();
-    let mut flow = Flow::Normal;
-    for stmt in &b.statements {
-        if !matches!(flow, Flow::Normal) {
-            break;
-        }
-        if let TypedStmt::Defer {
-            function,
-            arguments,
-            ..
-        } = stmt
-        {
-            let mut values = Vec::new();
-            for arg in arguments {
-                values.push(eval_expr(program, globals, env, arg)?);
-            }
-            defers.push((*function, values));
-        } else {
-            flow = statement(program, globals, env, stmt)?;
-        }
+    actions: &[crate::mir::MirDeferred],
+) -> Result<(), Error> {
+    for action in actions {
+        let values = action
+            .arguments
+            .iter()
+            .map(|argument| eval_expr(program, globals, env, argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _ = call(program, globals, action.function, values)?;
     }
-    for (id, args) in defers.into_iter().rev() {
-        let _ = call(program, globals, id, args)?;
-    }
-    Ok(flow)
+    Ok(())
 }
+
+/// Calls from expression evaluation are also lowered and executed as MIR.
+/// This keeps the evaluator from growing a second structured-control-flow
+/// implementation just for nested calls.
+fn call(
+    program: &TypedProgram,
+    globals: &mut Globals,
+    id: FunctionId,
+    args: Vec<Value>,
+) -> Result<Value, Error> {
+    let mir = MirProgram::lower(program)
+        .map_err(|error| Error(format!("MIR lowering failed: {error}")))?;
+    call_mir(program, &mir, globals, id, args)
+}
+
 fn consume_step() -> Result<(), Error> {
     if STEPS.fetch_add(1, Ordering::Relaxed) >= MAX_STEPS {
         return Err(Error("interpreter execution step limit exceeded".into()));
     }
     Ok(())
-}
-
-fn statement(
-    program: &TypedProgram,
-    globals: &mut Globals,
-    env: &mut Env,
-    s: &TypedStmt,
-) -> Result<Flow, Error> {
-    consume_step()?;
-    match s {
-        TypedStmt::Declare { id, value, .. } => {
-            let v = eval_expr(program, globals, env, value)?;
-            if matches!(value, TypedExpr::Propagate { .. }) {
-                if let Value::Result { error: true, .. } = v {
-                    return Ok(Flow::Return(v));
-                }
-                let v = match v {
-                    Value::Result { value, .. } => *value,
-                    other => other,
-                };
-                env.insert(*id, v);
-            } else {
-                env.insert(*id, v);
-            }
-            Ok(Flow::Normal)
-        }
-        TypedStmt::Store { target, value, .. } => {
-            let v = eval_expr(program, globals, env, value)?;
-            store(program, globals, env, target, v)?;
-            Ok(Flow::Normal)
-        }
-        TypedStmt::Expr { expression, .. } => {
-            eval_expr(program, globals, env, expression)?;
-            Ok(Flow::Normal)
-        }
-        TypedStmt::Return { value, .. } => {
-            let v = match value {
-                Some(v) => eval_expr(program, globals, env, v)?,
-                None => Value::Unit,
-            };
-            Ok(Flow::Return(v))
-        }
-        TypedStmt::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            if truth(&eval_expr(program, globals, env, condition)?)? {
-                block(program, globals, env, then_branch)
-            } else if let Some(b) = else_branch {
-                block(program, globals, env, b)
-            } else {
-                Ok(Flow::Normal)
-            }
-        }
-        TypedStmt::While {
-            condition, body, ..
-        } => {
-            loop {
-                consume_step()?;
-                if !truth(&eval_expr(program, globals, env, condition)?)? {
-                    break;
-                }
-                match block(program, globals, env, body)? {
-                    Flow::Normal | Flow::Continue => {}
-                    Flow::Break => break,
-                    Flow::Return(v) => return Ok(Flow::Return(v)),
-                }
-            }
-            Ok(Flow::Normal)
-        }
-        TypedStmt::Break { .. } => Ok(Flow::Break),
-        TypedStmt::Continue { .. } => Ok(Flow::Continue),
-        TypedStmt::Defer { .. } => unreachable!(),
-    }
 }
 fn load(
     program: &TypedProgram,
@@ -388,21 +388,18 @@ fn eval_expr(
         }
         TypedExpr::Call {
             function,
-            name,
             arguments,
             ..
         } => {
-            if name == "make_slice" {
-                return Err(Error(
-                    "interpreter does not support raw-pointer slice construction".into(),
-                ));
-            }
             let args = arguments
                 .iter()
                 .map(|x| eval_expr(program, globals, env, x))
                 .collect::<Result<Vec<_>, _>>()?;
             call(program, globals, *function, args)
         }
+        TypedExpr::MakeSlice { .. } => Err(Error(
+            "interpreter does not support raw-pointer slice construction".into(),
+        )),
         TypedExpr::Layout {
             kind,
             target,

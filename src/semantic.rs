@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::ast::{
@@ -6,10 +6,11 @@ use crate::ast::{
     VariableDecl, VariableKind,
 };
 use crate::lexer::Span;
+use crate::mir::FlowFlags as Flow;
 use crate::typed::{
-    DefId, FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedConstant,
-    TypedExpr, TypedField, TypedFunction, TypedGlobal, TypedParameter, TypedPlace, TypedProgram,
-    TypedStmt, TypedStruct,
+    DefId, FunctionId, IntegerWidth, Intrinsic, LayoutKind, LocalId, ResolvedType, TypeInterner,
+    TypedBlock, TypedConstant, TypedExpr, TypedField, TypedFunction, TypedGlobal, TypedParameter,
+    TypedPlace, TypedProgram, TypedStmt, TypedStruct,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,26 +182,10 @@ struct Variable {
 struct StructInfo {
     fields: Vec<(String, Type)>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Flow(u8);
-impl Flow {
-    const NORMAL: Self = Self(1);
-    const RETURN: Self = Self(2);
-    const BREAK: Self = Self(4);
-    const CONTINUE: Self = Self(8);
-    fn contains(self, x: Self) -> bool {
-        self.0 & x.0 != 0
-    }
-    fn union(self, x: Self) -> Self {
-        Self(self.0 | x.0)
-    }
-    fn without(self, x: Self) -> Self {
-        Self(self.0 & !x.0)
-    }
-}
-
 pub fn analyze(program: &Program) -> Result<(), SemanticError> {
-    Analyzer::new().analyze(program)
+    // Keep the historical validation-only API, but route it through the
+    // authoritative typed frontend instead of maintaining a second pass.
+    analyze_typed(program).map(|_| ())
 }
 pub fn analyze_typed(program: &Program) -> Result<TypedProgram, SemanticError> {
     Analyzer::new().analyze_typed(program)
@@ -308,9 +293,10 @@ impl Analyzer {
         Ok(())
     }
     pub fn analyze_typed(self, program: &Program) -> Result<TypedProgram, SemanticError> {
-        let pointer_width = self.pointer_width;
-        self.analyze(program)?;
-        TypedLowerer::new_with_pointer_width(program, pointer_width).lower()
+        // Typed lowering is the authoritative frontend. It performs name,
+        // type, place, control-flow, and constant checks while constructing
+        // the representation consumed by every backend.
+        TypedLowerer::new_with_pointer_width(program, self.pointer_width).lower()
     }
 
     fn collect_types(&mut self, p: &Program) -> Result<(), SemanticError> {
@@ -545,7 +531,12 @@ impl Analyzer {
                 Ok(Flow::CONTINUE)
             }
             Stmt::Return { value, span } => {
-                let expected = self.current_return_type.clone().unwrap();
+                let Some(expected) = self.current_return_type.clone() else {
+                    return Err(SemanticError::InvalidOperand {
+                        message: "return outside a function".into(),
+                        span: *span,
+                    });
+                };
                 match (is_unit(&expected), value) {
                     (true, None) => Ok(Flow::RETURN),
                     (true, Some(e)) => Err(SemanticError::TypeMismatch {
@@ -687,7 +678,7 @@ impl Analyzer {
                 *success
             }
             Expr::Null { span } => match expected {
-                Some(Type::Pointer(_)) => expected.cloned().unwrap(),
+                Some(pointer @ Type::Pointer(_)) => pointer.clone(),
                 _ => {
                     return Err(SemanticError::InvalidOperand {
                         message: "null requires a pointer type context".into(),
@@ -791,7 +782,10 @@ impl Analyzer {
                     self.expect_type(exp, &t, *span)?
                 }
                 let Type::Array { length, element } = at else {
-                    unreachable!()
+                    return Err(SemanticError::InvalidOperand {
+                        message: "array literal requires an array type".into(),
+                        span: *span,
+                    });
                 };
                 if elements.len() as u64 != *length {
                     return Err(SemanticError::InvalidOperand {
@@ -817,7 +811,10 @@ impl Analyzer {
                     });
                 };
                 let Some(info) = self.structs.get(s) else {
-                    unreachable!()
+                    return Err(SemanticError::UnknownType {
+                        name: s.clone(),
+                        span: *span,
+                    });
                 };
                 let Some((_, t)) = info.fields.iter().find(|(n, _)| n == name) else {
                     return Err(SemanticError::InvalidOperand {
@@ -932,11 +929,7 @@ impl Analyzer {
                         span: callee.span(),
                     });
                 };
-                if name == "return_ok"
-                    || name == "return_err"
-                    || name == "is_err"
-                    || name == "unwrap"
-                {
+                if Intrinsic::from_name(name).is_some_and(Intrinsic::is_result) {
                     let void_ok = name == "return_ok"
                         && matches!(expected, Some(Type::Result { success, .. }) if is_unit(success));
                     let expected_args = usize::from(!void_ok);
@@ -992,7 +985,7 @@ impl Analyzer {
                         _ => unreachable!(),
                     }
                 }
-                if name == "make_slice" {
+                if matches!(Intrinsic::from_name(name), Some(Intrinsic::MakeSlice)) {
                     if arguments.len() != 2 {
                         return Err(SemanticError::WrongArgumentCount {
                             name: name.clone(),
@@ -1172,7 +1165,12 @@ impl Analyzer {
                 let Type::Named(s) = bt else {
                     return Err(SemanticError::InvalidAssignmentTarget { span: *span });
                 };
-                let info = self.structs.get(&s).unwrap();
+                let Some(info) = self.structs.get(&s) else {
+                    return Err(SemanticError::UnknownType {
+                        name: s,
+                        span: *span,
+                    });
+                };
                 let Some((_, t)) = info.fields.iter().find(|(n, _)| n == name) else {
                     return Err(SemanticError::InvalidOperand {
                         message: format!("unknown field `{name}`"),
@@ -1402,10 +1400,13 @@ struct TypedLowerer<'a> {
     structs: HashMap<String, (DefId, StructDecl)>,
     globals: HashMap<String, (Type, bool)>,
     global_ids: HashMap<String, DefId>,
+    definition_ids: HashMap<String, DefId>,
     constants: HashMap<String, &'a VariableDecl>,
     scopes: Vec<HashMap<String, (LocalId, ResolvedType)>>,
+    immutable_locals: HashSet<LocalId>,
     next_local: u32,
     current_return_type: ResolvedType,
+    loop_depth: usize,
 }
 impl<'a> TypedLowerer<'a> {
     fn new_with_pointer_width(p: &'a Program, _pointer_width: u32) -> Self {
@@ -1414,13 +1415,23 @@ impl<'a> TypedLowerer<'a> {
         let mut globals = HashMap::new();
         let mut constants = HashMap::new();
         let mut global_ids = HashMap::new();
-        for (i, d) in p.declarations.iter().enumerate() {
+        let mut definition_ids = HashMap::new();
+        let mut next_def = 0u32;
+        for d in &p.declarations {
+            let (name, id) = match d {
+                Decl::Function(f) => (&f.name, DefId(next_def)),
+                Decl::Struct(s) => (&s.name, DefId(next_def)),
+                Decl::Variable(v) => (&v.name, DefId(next_def)),
+                Decl::Comptime { .. } => continue,
+            };
+            next_def += 1;
+            definition_ids.insert(name.clone(), id);
             match d {
                 Decl::Function(f) => {
-                    functions.insert(f.name.clone(), (DefId(i as u32), f));
+                    functions.insert(f.name.clone(), (id, f));
                 }
                 Decl::Struct(s) => {
-                    structs.insert(s.name.clone(), (DefId(i as u32), s.clone()));
+                    structs.insert(s.name.clone(), (id, s.clone()));
                 }
                 Decl::Variable(v) => {
                     let t =
@@ -1428,12 +1439,12 @@ impl<'a> TypedLowerer<'a> {
                             .unwrap_or_else(|| infer_ast_type_with_globals(&v.value, &globals));
                     let m = !matches!(v.kind, VariableKind::Immutable);
                     globals.insert(v.name.clone(), (t, m));
-                    global_ids.insert(v.name.clone(), DefId(i as u32));
+                    global_ids.insert(v.name.clone(), id);
                     if !m {
                         constants.insert(v.name.clone(), v);
                     }
                 }
-                Decl::Comptime { .. } => {}
+                Decl::Comptime { .. } => unreachable!(),
             }
         }
         Self {
@@ -1442,14 +1453,17 @@ impl<'a> TypedLowerer<'a> {
             structs,
             globals,
             global_ids,
+            definition_ids,
             constants,
             scopes: Vec::new(),
+            immutable_locals: HashSet::new(),
             next_local: 0,
             current_return_type: ResolvedType::Unit,
+            loop_depth: 0,
         }
     }
     fn lower(mut self) -> Result<TypedProgram, SemanticError> {
-        let structs = self
+        let structs: Vec<TypedStruct> = self
             .program
             .declarations
             .iter()
@@ -1504,8 +1518,27 @@ impl<'a> TypedLowerer<'a> {
             }
         }
         let symbols = self.symbol_table();
+        let mut types = TypeInterner::default();
+        for structure in &structs {
+            for field in &structure.fields {
+                intern_type(&mut types, &field.ty);
+            }
+        }
+        for global in &globals_out {
+            intern_type(&mut types, &global.ty);
+        }
+        for constant in &constants_out {
+            intern_type(&mut types, &constant.ty);
+        }
+        for function in &functions {
+            for parameter in &function.params {
+                intern_type(&mut types, &parameter.ty);
+            }
+            intern_type(&mut types, &function.return_type);
+        }
         Ok(TypedProgram {
             symbols,
+            types,
             structs,
             globals: globals_out,
             constants: constants_out,
@@ -1513,16 +1546,11 @@ impl<'a> TypedLowerer<'a> {
         })
     }
     fn declaration_index(&self, name: &str) -> u32 {
-        self.program
-            .declarations
-            .iter()
-            .position(|declaration| match declaration {
-                Decl::Function(f) => f.name == name,
-                Decl::Struct(s) => s.name == name,
-                Decl::Variable(v) => v.name == name,
-                Decl::Comptime { .. } => false,
-            })
-            .expect("validated declaration must have an identity") as u32
+        self.definition_ids
+            .get(name)
+            .copied()
+            .unwrap_or(DefId(u32::MAX))
+            .0
     }
 
     fn symbol_table(&self) -> crate::typed::SymbolTable {
@@ -1530,8 +1558,7 @@ impl<'a> TypedLowerer<'a> {
             .program
             .declarations
             .iter()
-            .enumerate()
-            .filter_map(|(index, declaration)| {
+            .filter_map(|declaration| {
                 let (name, kind) = match declaration {
                     Decl::Function(f) => (&f.name, crate::typed::DefinitionKind::Function),
                     Decl::Struct(s) => (&s.name, crate::typed::DefinitionKind::Struct),
@@ -1546,7 +1573,11 @@ impl<'a> TypedLowerer<'a> {
                     Decl::Comptime { .. } => return None,
                 };
                 Some(crate::typed::Definition {
-                    id: DefId(index as u32),
+                    id: self
+                        .definition_ids
+                        .get(name)
+                        .copied()
+                        .unwrap_or(DefId(u32::MAX)),
                     name: name.clone(),
                     kind,
                 })
@@ -1794,7 +1825,9 @@ impl<'a> TypedLowerer<'a> {
     }
     fn lower_function(&mut self, f: &FunctionDecl) -> Result<TypedFunction, SemanticError> {
         self.scopes.push(HashMap::new());
+        self.immutable_locals.clear();
         self.next_local = 0;
+        self.loop_depth = 0;
         self.current_return_type = self.resolve(&f.return_type);
         let mut params = Vec::new();
         for p in &f.params {
@@ -1809,8 +1842,24 @@ impl<'a> TypedLowerer<'a> {
         }
         let body = self.lower_block_contents(&f.body)?;
         self.scopes.pop();
+        if !f.is_extern
+            && self.current_return_type != ResolvedType::Unit
+            && block_may_fall_through(&f.body)
+        {
+            return Err(SemanticError::MissingReturn {
+                function: f.name.clone(),
+                span: f.body.span,
+            });
+        }
         Ok(TypedFunction {
-            id: self.functions[&f.name].0,
+            id: self
+                .functions
+                .get(&f.name)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| SemanticError::UndefinedName {
+                    name: f.name.clone(),
+                    span: f.span,
+                })?,
             name: f.name.clone(),
             params,
             return_type: self.resolve(&f.return_type),
@@ -1858,13 +1907,29 @@ impl<'a> TypedLowerer<'a> {
                 condition,
                 body,
                 span,
-            } => TypedStmt::While {
-                condition: self.lower_expr(condition, Some(ResolvedType::Bool))?,
-                body: self.lower_block(body)?,
-                span: *span,
-            },
-            Stmt::Break { span } => TypedStmt::Break { span: *span },
-            Stmt::Continue { span } => TypedStmt::Continue { span: *span },
+            } => {
+                let condition = self.lower_expr(condition, Some(ResolvedType::Bool))?;
+                self.loop_depth += 1;
+                let body = self.lower_block(body)?;
+                self.loop_depth -= 1;
+                TypedStmt::While {
+                    condition,
+                    body,
+                    span: *span,
+                }
+            }
+            Stmt::Break { span } => {
+                if self.loop_depth == 0 {
+                    return Err(SemanticError::BreakOutsideLoop { span: *span });
+                }
+                TypedStmt::Break { span: *span }
+            }
+            Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    return Err(SemanticError::ContinueOutsideLoop { span: *span });
+                }
+                TypedStmt::Continue { span: *span }
+            }
             Stmt::Defer { call, span } => {
                 let lowered = self.lower_expr(call, None)?;
                 let TypedExpr::Call {
@@ -1898,6 +1963,9 @@ impl<'a> TypedLowerer<'a> {
                 let value = self.lower_expr(&v.value, declared.clone())?;
                 let ty = declared.unwrap_or_else(|| value.ty());
                 let id = self.new_local(&v.name, ty.clone(), v.span)?;
+                if matches!(v.kind, VariableKind::Immutable) {
+                    self.immutable_locals.insert(id);
+                }
                 TypedStmt::Declare {
                     id,
                     name: v.name.clone(),
@@ -1913,6 +1981,12 @@ impl<'a> TypedLowerer<'a> {
                 span,
             } => {
                 let place = self.lower_place(target)?;
+                if !self.place_is_mutable(&place) {
+                    return Err(SemanticError::ImmutableAssignment {
+                        name: place_name(target),
+                        span: *span,
+                    });
+                }
                 let ty = place.ty();
                 TypedStmt::Store {
                     target: place,
@@ -1950,7 +2024,12 @@ impl<'a> TypedLowerer<'a> {
                 let Type::Named(s) = self.ast_type_of_place(&p) else {
                     return Err(SemanticError::InvalidAssignmentTarget { span: *span });
                 };
-                let st = &self.structs.get(&s).unwrap().1;
+                let Some(st) = self.structs.get(&s).map(|(_, structure)| structure) else {
+                    return Err(SemanticError::UnknownType {
+                        name: s,
+                        span: *span,
+                    });
+                };
                 let Some((i, f)) = st.fields.iter().enumerate().find(|(_, f)| f.name == *name)
                 else {
                     return Err(SemanticError::InvalidOperand {
@@ -1986,6 +2065,15 @@ impl<'a> TypedLowerer<'a> {
                     Type::Slice(element) => (element, None),
                     _ => return Err(SemanticError::InvalidAssignmentTarget { span: *span }),
                 };
+                if matches!(e, Expr::Index { .. })
+                    && let Some(value) = self.constant_integer(index)
+                    && (value.is_negative() || length.is_some_and(|bound| value as u64 >= bound))
+                {
+                    return Err(SemanticError::InvalidLiteral {
+                        message: "array index is out of bounds".into(),
+                        span: index.span(),
+                    });
+                }
                 let ix = self.lower_expr(
                     index,
                     Some(ResolvedType::Integer {
@@ -2014,6 +2102,20 @@ impl<'a> TypedLowerer<'a> {
             }
         }
     }
+    fn place_is_mutable(&self, place: &TypedPlace) -> bool {
+        match place {
+            TypedPlace::Local { id, .. } => !self.immutable_locals.contains(id),
+            TypedPlace::Global { name, .. } => {
+                self.globals.get(name).is_some_and(|(_, mutable)| *mutable)
+            }
+            TypedPlace::Temporary { .. } => false,
+            TypedPlace::Field { base, .. } | TypedPlace::Index { base, .. } => {
+                self.place_is_mutable(base)
+            }
+            TypedPlace::Dereference { .. } => true,
+        }
+    }
+
     fn ast_type_of_place(&self, p: &TypedPlace) -> Type {
         match p {
             TypedPlace::Local { ty, .. }
@@ -2073,28 +2175,43 @@ impl<'a> TypedLowerer<'a> {
                 message: "compile-time marker was not expanded before lowering".into(),
                 span: *span,
             }),
-            Expr::Integer { value, .. } => Ok(TypedExpr::Integer {
-                value: *value,
-                ty: expected
+            Expr::Integer { value, .. } => {
+                let ty = expected
+                    .as_ref()
                     .filter(|t| t.is_integer())
+                    .cloned()
                     .unwrap_or(ResolvedType::Integer {
                         width: IntegerWidth::Bits(32),
                         signed: true,
-                    }),
-                span,
-            }),
-            Expr::Float { value, .. } => Ok(TypedExpr::Float {
-                value: *value,
-                ty: expected
+                    });
+                self.ensure_expected(expected.as_ref(), &ty, span)?;
+                Ok(TypedExpr::Integer {
+                    value: *value,
+                    ty,
+                    span,
+                })
+            }
+            Expr::Float { value, .. } => {
+                let ty = expected
+                    .as_ref()
                     .filter(|t| matches!(t, ResolvedType::Float { .. }))
-                    .unwrap_or(ResolvedType::Float { bits: 64 }),
-                span,
-            }),
-            Expr::Bool { value, .. } => Ok(TypedExpr::Bool {
-                value: *value,
-                ty: ResolvedType::Bool,
-                span,
-            }),
+                    .cloned()
+                    .unwrap_or(ResolvedType::Float { bits: 64 });
+                self.ensure_expected(expected.as_ref(), &ty, span)?;
+                Ok(TypedExpr::Float {
+                    value: *value,
+                    ty,
+                    span,
+                })
+            }
+            Expr::Bool { value, .. } => {
+                self.ensure_expected(expected.as_ref(), &ResolvedType::Bool, span)?;
+                Ok(TypedExpr::Bool {
+                    value: *value,
+                    ty: ResolvedType::Bool,
+                    span,
+                })
+            }
             Expr::String { .. } => Err(SemanticError::InvalidOperand {
                 message: "strings are only available in compile-time context".into(),
                 span,
@@ -2161,6 +2278,7 @@ impl<'a> TypedLowerer<'a> {
             }),
             Expr::Identifier { name, .. } => {
                 if let Some((id, t)) = self.lookup(name) {
+                    self.ensure_expected(expected.as_ref(), &t, span)?;
                     return Ok(TypedExpr::Load {
                         id,
                         name: name.clone(),
@@ -2170,6 +2288,7 @@ impl<'a> TypedLowerer<'a> {
                 }
                 if let Some((t, m)) = self.globals.get(name) {
                     let ty = self.resolve(t);
+                    self.ensure_expected(expected.as_ref(), &ty, span)?;
                     if *m {
                         return Ok(TypedExpr::GlobalLoad {
                             id: self.global_ids[name],
@@ -2193,23 +2312,64 @@ impl<'a> TypedLowerer<'a> {
                 })
             }
             Expr::StructLiteral { name, fields, .. } => {
-                let st = self.structs.get(name).unwrap().clone();
+                let Some((struct_id, structure)) = self.structs.get(name).cloned() else {
+                    return Err(SemanticError::UnknownType {
+                        name: name.clone(),
+                        span,
+                    });
+                };
                 let mut out = Vec::new();
-                for f in &st.1.fields {
-                    let x = fields.iter().find(|x| x.name == f.name).unwrap();
-                    out.push(self.lower_expr(&x.value, Some(self.resolve(&f.ty)))?)
+                let mut seen = std::collections::HashSet::new();
+                for initializer in fields {
+                    if !seen.insert(initializer.name.as_str()) {
+                        return Err(SemanticError::DuplicateName {
+                            name: initializer.name.clone(),
+                            span: initializer.span,
+                        });
+                    }
+                    if !structure
+                        .fields
+                        .iter()
+                        .any(|field| field.name == initializer.name)
+                    {
+                        return Err(SemanticError::InvalidOperand {
+                            message: format!("unknown field `{}`", initializer.name),
+                            span: initializer.span,
+                        });
+                    }
+                }
+                for field in &structure.fields {
+                    let Some(initializer) = fields.iter().find(|x| x.name == field.name) else {
+                        return Err(SemanticError::InvalidOperand {
+                            message: format!("missing field `{}` in `{name}`", field.name),
+                            span,
+                        });
+                    };
+                    out.push(self.lower_expr(&initializer.value, Some(self.resolve(&field.ty)))?)
                 }
                 Ok(TypedExpr::StructLiteral {
-                    ty: ResolvedType::Struct(st.0),
+                    ty: ResolvedType::Struct(struct_id),
                     fields: out,
                     span,
                 })
             }
             Expr::ArrayLiteral { ty, elements, .. } => {
                 let rt = self.resolve(ty);
-                let Type::Array { element, .. } = ty else {
-                    unreachable!()
+                let Type::Array { length, element } = ty else {
+                    return Err(SemanticError::InvalidOperand {
+                        message: "array literal requires an array type".into(),
+                        span,
+                    });
                 };
+                if elements.len() as u64 != *length {
+                    return Err(SemanticError::InvalidOperand {
+                        message: format!(
+                            "array literal expects {length} elements, got {}",
+                            elements.len()
+                        ),
+                        span,
+                    });
+                }
                 let out = elements
                     .iter()
                     .map(|x| self.lower_expr(x, Some(self.resolve(element))))
@@ -2283,9 +2443,13 @@ impl<'a> TypedLowerer<'a> {
                     left,
                     if logical {
                         Some(ResolvedType::Bool)
+                    } else if matches!(left.as_ref(), Expr::Integer { .. } | Expr::Float { .. }) {
+                        expected.as_ref().and_then(|t| {
+                            (t.is_integer() || matches!(t, ResolvedType::Float { .. }))
+                                .then(|| t.clone())
+                        })
                     } else {
-                        expected
-                            .filter(|t| t.is_integer() || matches!(t, ResolvedType::Float { .. }))
+                        None
                     },
                 )?;
                 let re = self.lower_expr(
@@ -2302,15 +2466,33 @@ impl<'a> TypedLowerer<'a> {
                     },
                 )?;
                 let ot = le.ty();
+                let pointer_arithmetic = matches!(ot, ResolvedType::Pointer(_))
+                    && matches!(operator, BinaryOp::Add | BinaryOp::Subtract)
+                    && re.ty().is_integer();
+                if !logical && !comparison && !pointer_arithmetic && re.ty() != ot {
+                    return Err(SemanticError::TypeMismatch {
+                        expected: self.ast_from_resolved(&ot),
+                        found: self.ast_from_resolved(&re.ty()),
+                        span: right.span(),
+                    });
+                }
+                let result_ty = if logical || comparison {
+                    ResolvedType::Bool
+                } else if matches!(
+                    (&ot, &re.ty()),
+                    (ResolvedType::Pointer(_), ResolvedType::Pointer(_))
+                ) && *operator == BinaryOp::Subtract
+                {
+                    intp(true)
+                } else {
+                    ot.clone()
+                };
+                self.ensure_expected(expected.as_ref(), &result_ty, span)?;
                 Ok(TypedExpr::Binary {
                     left: Box::new(le),
                     operator: *operator,
                     right: Box::new(re),
-                    ty: if logical || comparison {
-                        ResolvedType::Bool
-                    } else {
-                        ot.clone()
-                    },
+                    ty: result_ty,
                     operand_type: ot,
                     span,
                 })
@@ -2319,29 +2501,59 @@ impl<'a> TypedLowerer<'a> {
                 callee, arguments, ..
             } => {
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
-                    unreachable!()
+                    return Err(SemanticError::NotCallable {
+                        name: "<expression>".into(),
+                        span,
+                    });
                 };
-                if name == "return_ok"
-                    || name == "return_err"
-                    || name == "is_err"
-                    || name == "unwrap"
-                {
+                if let Some(intrinsic) = Intrinsic::from_name(name).filter(|x| x.is_result()) {
                     let arg = arguments
                         .first()
                         .map(|a| self.lower_expr(a, None))
                         .transpose()?;
-                    match name.as_str() {
-                        "is_err" => {
+                    match intrinsic {
+                        Intrinsic::IsErr => {
+                            if arguments.len() != 1 {
+                                return Err(SemanticError::WrongArgumentCount {
+                                    name: name.clone(),
+                                    expected: 1,
+                                    found: arguments.len(),
+                                    span,
+                                });
+                            }
                             return Ok(TypedExpr::IsErr {
-                                value: Box::new(arg.unwrap()),
+                                value: Box::new(arg.ok_or_else(|| {
+                                    SemanticError::WrongArgumentCount {
+                                        name: name.clone(),
+                                        expected: 1,
+                                        found: 0,
+                                        span,
+                                    }
+                                })?),
                                 ty: ResolvedType::Bool,
                                 span,
                             });
                         }
-                        "unwrap" => {
-                            let arg = arg.unwrap();
+                        Intrinsic::Unwrap => {
+                            if arguments.len() != 1 {
+                                return Err(SemanticError::WrongArgumentCount {
+                                    name: name.clone(),
+                                    expected: 1,
+                                    found: arguments.len(),
+                                    span,
+                                });
+                            }
+                            let arg = arg.ok_or_else(|| SemanticError::WrongArgumentCount {
+                                name: name.clone(),
+                                expected: 1,
+                                found: 0,
+                                span,
+                            })?;
                             let ResolvedType::Result { success, .. } = arg.ty() else {
-                                unreachable!()
+                                return Err(SemanticError::InvalidOperand {
+                                    message: "unwrap requires a result value".into(),
+                                    span,
+                                });
                             };
                             return Ok(TypedExpr::Unwrap {
                                 ty: *success,
@@ -2349,13 +2561,17 @@ impl<'a> TypedLowerer<'a> {
                                 span,
                             });
                         }
-                        "return_ok" | "return_err" => {
+                        Intrinsic::ReturnOk | Intrinsic::ReturnErr => {
                             let ResolvedType::Result { success, error } =
                                 self.current_return_type.clone()
                             else {
-                                unreachable!()
+                                return Err(SemanticError::InvalidPropagation {
+                                    message: "return_ok/return_err requires a result return type"
+                                        .into(),
+                                    span,
+                                });
                             };
-                            let wanted = if name == "return_ok" {
+                            let wanted = if intrinsic == Intrinsic::ReturnOk {
                                 *success.clone()
                             } else {
                                 *error.clone()
@@ -2369,7 +2585,7 @@ impl<'a> TypedLowerer<'a> {
                                     span,
                                 }
                             };
-                            return Ok(if name == "return_ok" {
+                            return Ok(if intrinsic == Intrinsic::ReturnOk {
                                 TypedExpr::ResultOk {
                                     value: Box::new(value),
                                     ty: ResolvedType::Result { success, error },
@@ -2383,10 +2599,23 @@ impl<'a> TypedLowerer<'a> {
                                 }
                             });
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(SemanticError::InvalidOperand {
+                                message: "invalid result builtin".into(),
+                                span,
+                            });
+                        }
                     }
                 }
-                if name == "make_slice" {
+                if matches!(Intrinsic::from_name(name), Some(Intrinsic::MakeSlice)) {
+                    if arguments.len() != 2 {
+                        return Err(SemanticError::WrongArgumentCount {
+                            name: name.clone(),
+                            expected: 2,
+                            found: arguments.len(),
+                            span,
+                        });
+                    }
                     let pointer = if matches!(&arguments[0], Expr::Null { .. }) {
                         self.lower_expr(
                             &arguments[0],
@@ -2398,23 +2627,40 @@ impl<'a> TypedLowerer<'a> {
                     let length = self.lower_expr(&arguments[1], Some(intp(false)))?;
                     let element = match pointer.ty() {
                         ResolvedType::Pointer(x) => *x,
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(SemanticError::InvalidOperand {
+                                message: "make_slice requires a pointer argument".into(),
+                                span,
+                            });
+                        }
                     };
-                    return Ok(TypedExpr::Call {
-                        function: DefId(u32::MAX),
-                        name: name.clone(),
-                        arguments: vec![pointer, length],
-                        parameter_types: vec![],
+                    return Ok(TypedExpr::MakeSlice {
+                        pointer: Box::new(pointer),
+                        length: Box::new(length),
+                        element: Box::new(element.clone()),
                         ty: ResolvedType::Slice(Box::new(element)),
                         span,
                     });
                 }
-                let (id, f) = self.functions.get(name).copied().unwrap();
+                let Some((id, f)) = self.functions.get(name).copied() else {
+                    return Err(SemanticError::UndefinedName {
+                        name: name.clone(),
+                        span,
+                    });
+                };
                 let pts = f
                     .params
                     .iter()
                     .map(|p| self.resolve(&p.ty))
                     .collect::<Vec<_>>();
+                if arguments.len() != pts.len() {
+                    return Err(SemanticError::WrongArgumentCount {
+                        name: name.clone(),
+                        expected: pts.len(),
+                        found: arguments.len(),
+                        span,
+                    });
+                }
                 let args = arguments
                     .iter()
                     .zip(&pts)
@@ -2460,6 +2706,39 @@ impl<'a> TypedLowerer<'a> {
     fn lookup(&self, n: &str) -> Option<(LocalId, ResolvedType)> {
         self.scopes.iter().rev().find_map(|s| s.get(n).cloned())
     }
+    fn ensure_expected(
+        &self,
+        expected: Option<&ResolvedType>,
+        actual: &ResolvedType,
+        span: Span,
+    ) -> Result<(), SemanticError> {
+        if let Some(expected) = expected
+            && expected != actual
+        {
+            eprintln!("lower mismatch expected={expected:?} actual={actual:?} at {span:?}");
+            return Err(SemanticError::TypeMismatch {
+                expected: self.ast_from_resolved(expected),
+                found: self.ast_from_resolved(actual),
+                span,
+            });
+        }
+        Ok(())
+    }
+
+    fn constant_integer(&self, expression: &Expr) -> Option<i128> {
+        match expression {
+            Expr::Integer { value, .. } => Some(*value),
+            Expr::Identifier { name, .. } => {
+                self.constants
+                    .get(name)
+                    .and_then(|constant| match &constant.value {
+                        Expr::Integer { value, .. } => Some(*value),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        }
+    }
     fn resolve(&self, t: &Type) -> ResolvedType {
         match t {
             Type::Unit => ResolvedType::Unit,
@@ -2500,6 +2779,61 @@ impl<'a> TypedLowerer<'a> {
         }
     }
 }
+
+fn block_may_fall_through(block: &Block) -> bool {
+    let Some(last) = block.statements.last() else {
+        return true;
+    };
+    match last {
+        Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => false,
+        Stmt::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => block_may_fall_through(then_branch) || block_may_fall_through(else_branch),
+        Stmt::While {
+            condition, body, ..
+        } if matches!(condition, Expr::Bool { value: true, .. }) && !block_contains_break(body) => {
+            false
+        }
+        _ => true,
+    }
+}
+
+fn block_contains_break(block: &Block) -> bool {
+    block.statements.iter().any(|statement| match statement {
+        Stmt::Break { .. } => true,
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            block_contains_break(then_branch)
+                || else_branch.as_ref().is_some_and(block_contains_break)
+        }
+        Stmt::While { body, .. } => block_contains_break(body),
+        _ => false,
+    })
+}
+
+fn intern_type(interner: &mut TypeInterner, ty: &ResolvedType) {
+    interner.intern(ty.clone());
+    match ty {
+        ResolvedType::Array { element, .. }
+        | ResolvedType::Pointer(element)
+        | ResolvedType::Slice(element) => intern_type(interner, element),
+        ResolvedType::Result { success, error } => {
+            intern_type(interner, success);
+            intern_type(interner, error);
+        }
+        ResolvedType::Unit
+        | ResolvedType::Bool
+        | ResolvedType::Integer { .. }
+        | ResolvedType::Float { .. }
+        | ResolvedType::Struct(_) => {}
+    }
+}
+
 fn infer_ast_type_with_globals(e: &Expr, globals: &HashMap<String, (Type, bool)>) -> Type {
     match e {
         Expr::Integer { .. } => named("i32"),

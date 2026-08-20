@@ -1,10 +1,11 @@
 use crate::ast::Program;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::lexer::Span;
+use crate::mir::{FlowFlags as Flow, MirFunction, MirInstruction, MirProgram, MirTerminator};
 use crate::semantic;
 use crate::typed::{
     DefId, FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedExpr,
-    TypedFunction, TypedPlace, TypedProgram, TypedStmt,
+    TypedPlace, TypedProgram, TypedStmt,
 };
 use inkwell::AddressSpace;
 use inkwell::basic_block::BasicBlock;
@@ -82,24 +83,6 @@ struct Deferred<'ctx> {
     function: FunctionValue<'ctx>,
     arguments: Vec<BasicMetadataValueEnum<'ctx>>,
 }
-#[derive(Clone, Copy)]
-struct Flow(u8);
-impl Flow {
-    const NORMAL: Self = Self(1);
-    const RETURN: Self = Self(2);
-    const BREAK: Self = Self(4);
-    const CONTINUE: Self = Self(8);
-    fn contains(self, x: Self) -> bool {
-        self.0 & x.0 != 0
-    }
-    fn union(self, x: Self) -> Self {
-        Self(self.0 | x.0)
-    }
-    fn without(self, x: Self) -> Self {
-        Self(self.0 & !x.0)
-    }
-}
-
 pub struct CodeGenerator<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
@@ -120,7 +103,9 @@ pub struct CodeGenerator<'ctx> {
     debug: Option<(String, bool, String)>,
     debug_locals: Vec<DebugLocal<'ctx>>,
     debug_locations: HashMap<usize, inkwell::debug_info::DILocation<'ctx>>,
+    mir_cleanup: Vec<crate::mir::MirDeferred>,
 }
+
 impl<'ctx> CodeGenerator<'ctx> {
     pub fn new(c: &'ctx Context, n: &str) -> Self {
         Self::with_pointer_width(c, n, usize::BITS)
@@ -152,6 +137,7 @@ impl<'ctx> CodeGenerator<'ctx> {
             debug: None,
             debug_locals: Vec::new(),
             debug_locations: HashMap::new(),
+            mir_cleanup: Vec::new(),
         }
     }
     pub fn with_debug_info(mut self, filename: impl Into<String>, optimized: bool) -> Self {
@@ -192,6 +178,7 @@ impl<'ctx> CodeGenerator<'ctx> {
             debug: None,
             debug_locals: Vec::new(),
             debug_locations: HashMap::new(),
+            mir_cleanup: Vec::new(),
         }
     }
     pub fn generate(self, p: &Program) -> Result<Module<'ctx>, CodegenError> {
@@ -200,6 +187,11 @@ impl<'ctx> CodeGenerator<'ctx> {
         self.generate_typed(&t)
     }
     pub fn generate_typed(mut self, p: &TypedProgram) -> Result<Module<'ctx>, CodegenError> {
+        // Validate the shared CFG before selecting the LLVM emission adapter.
+        // This keeps backend-specific control-flow code from accepting a
+        // structure the interpreter or another backend could not represent.
+        let mir = MirProgram::lower(p)
+            .map_err(|error| CodegenError::at(error.to_string(), error.span()))?;
         self.declare_structs(p)?;
         self.declare_globals(p)?;
         self.declare_functions(p)?;
@@ -264,7 +256,10 @@ impl<'ctx> CodeGenerator<'ctx> {
                         None,
                     );
                     self.builder.set_current_debug_location(location);
-                    self.generate_function(f)?;
+                    let mir_function = mir
+                        .function(f.id)
+                        .ok_or_else(|| CodegenError::new("missing MIR function"))?;
+                    self.generate_mir_function(mir_function)?;
                     // Preserve parameter names in DWARF. Values may still be
                     // optimized away, so this is intentionally best-effort.
                     for (index, parameter) in f.params.iter().enumerate() {
@@ -332,7 +327,10 @@ impl<'ctx> CodeGenerator<'ctx> {
         } else {
             for f in &p.functions {
                 if !f.is_extern {
-                    self.generate_function(f)?;
+                    let mir_function = mir
+                        .function(f.id)
+                        .ok_or_else(|| CodegenError::new("missing MIR function"))?;
+                    self.generate_mir_function(mir_function)?;
                 }
             }
         }
@@ -513,7 +511,7 @@ impl<'ctx> CodeGenerator<'ctx> {
         }
     }
 
-    fn generate_function(&mut self, f: &TypedFunction) -> Result<(), CodegenError> {
+    fn generate_mir_function(&mut self, f: &MirFunction) -> Result<(), CodegenError> {
         let fun = self.functions[&f.id];
         self.current_function = Some(fun);
         self.current_function_id = f.id;
@@ -522,35 +520,141 @@ impl<'ctx> CodeGenerator<'ctx> {
         self.debug_locals.clear();
         self.loop_targets.clear();
         self.defer_scopes.clear();
-        let entry = self.context.append_basic_block(fun, "entry");
+
+        let blocks = f
+            .blocks
+            .iter()
+            .map(|block| {
+                let name = if block.id == f.entry {
+                    "entry".to_string()
+                } else {
+                    format!("mir.{}", block.id.0)
+                };
+                (block.id, self.context.append_basic_block(fun, &name))
+            })
+            .collect::<HashMap<_, _>>();
+        let entry = blocks[&f.entry];
         self.builder.position_at_end(entry);
-        for (i, p) in f.params.iter().enumerate() {
-            let v = fun.get_nth_param(i as u32).unwrap();
-            let v = self.abi_unpack(v, f.id, p.ty.clone(), p.span)?;
-            let lt = self.basic_type(p.ty.clone())?;
-            let ptr = self.builder.build_alloca(lt, &format!("{}.addr", p.name))?;
-            self.builder.build_store(ptr, v)?;
-            self.locals.insert(
-                p.id,
-                Local {
-                    pointer: ptr,
-                    llvm_type: lt,
-                },
-            );
+        for (index, parameter) in f.params.iter().enumerate() {
+            let value = fun.get_nth_param(index as u32).ok_or_else(|| {
+                CodegenError::at("missing MIR function parameter", parameter.span)
+            })?;
+            let value = self.abi_unpack(value, f.id, parameter.ty.clone(), parameter.span)?;
+            let llvm_type = self.basic_type(parameter.ty.clone())?;
+            let pointer = self
+                .builder
+                .build_alloca(llvm_type, &format!("{}.addr", parameter.name))?;
+            self.builder.build_store(pointer, value)?;
+            self.locals
+                .insert(parameter.id, Local { pointer, llvm_type });
         }
-        let flow = self.generate_block(&f.body)?;
-        if flow.contains(Flow::NORMAL) {
-            if self.current_return_type != ResolvedType::Unit {
-                return Err(CodegenError::at(
-                    format!(
-                        "function `{}` does not return a value on every path",
-                        f.name
-                    ),
-                    f.body.span,
-                ));
+        for block in &f.blocks {
+            self.builder.position_at_end(blocks[&block.id]);
+            self.mir_cleanup = f.cleanup.get(&block.id).cloned().unwrap_or_default();
+            for instruction in &block.instructions {
+                match instruction {
+                    MirInstruction::Declare {
+                        id,
+                        name,
+                        ty,
+                        mutable,
+                        value,
+                        span,
+                    } => {
+                        self.generate_statement(&TypedStmt::Declare {
+                            id: *id,
+                            name: name.clone(),
+                            ty: ty.clone(),
+                            mutable: *mutable,
+                            value: value.clone(),
+                            span: *span,
+                        })?;
+                    }
+                    MirInstruction::Store {
+                        target,
+                        value,
+                        ty,
+                        span,
+                    } => {
+                        self.generate_statement(&TypedStmt::Store {
+                            target: target.clone(),
+                            value: value.clone(),
+                            ty: ty.clone(),
+                            span: *span,
+                        })?;
+                    }
+                    MirInstruction::Expr { expression, span } => {
+                        self.generate_statement(&TypedStmt::Expr {
+                            expression: expression.clone(),
+                            span: *span,
+                        })?;
+                    }
+                    MirInstruction::RunDefers { actions, .. } => {
+                        for action in actions {
+                            let arguments = action
+                                .arguments
+                                .iter()
+                                .map(|argument| {
+                                    let value = self.generate_expression(argument)?;
+                                    let value = self.abi_pack(
+                                        value,
+                                        action.function,
+                                        argument.ty(),
+                                        argument.span(),
+                                    )?;
+                                    Ok(BasicMetadataValueEnum::from(value))
+                                })
+                                .collect::<Result<Vec<_>, CodegenError>>()?;
+                            let function = self
+                                .functions
+                                .get(&action.function)
+                                .copied()
+                                .ok_or_else(|| {
+                                    CodegenError::at("unknown deferred function", action.span)
+                                })?;
+                            self.builder
+                                .build_call(function, &arguments, "defer.call")?;
+                        }
+                    }
+                    MirInstruction::ScopeEnter | MirInstruction::ScopeExit => {
+                        return Err(CodegenError::new("legacy MIR cleanup marker"));
+                    }
+                }
             }
-            self.builder.build_return(None)?;
+            match &block.terminator {
+                MirTerminator::Jump(target) => {
+                    self.builder.build_unconditional_branch(blocks[target])?;
+                }
+                MirTerminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                    span,
+                } => {
+                    if let Some(location) = self.debug_locations.get(&span.start).copied() {
+                        self.builder.set_current_debug_location(location);
+                    }
+                    let value = self.generate_expression(condition)?;
+                    let value = self.as_condition(value, condition.span())?;
+                    self.builder.build_conditional_branch(
+                        value,
+                        blocks[then_block],
+                        blocks[else_block],
+                    )?;
+                }
+                MirTerminator::Return(value) => {
+                    let statement = TypedStmt::Return {
+                        value: value.clone(),
+                        span: value.as_ref().map(TypedExpr::span).unwrap_or(f.span),
+                    };
+                    self.generate_statement(&statement)?;
+                }
+                MirTerminator::Unreachable => {
+                    self.builder.build_unreachable()?;
+                }
+            }
         }
+        self.defer_scopes.clear();
         if !fun.verify(true) {
             return Err(CodegenError::new(format!(
                 "LLVM verification failed for function `{}`",
@@ -559,6 +663,7 @@ impl<'ctx> CodeGenerator<'ctx> {
         }
         Ok(())
     }
+
     fn generate_block(&mut self, b: &TypedBlock) -> Result<Flow, CodegenError> {
         let saved = self.locals.clone();
         self.defer_scopes.push(Vec::new());
@@ -664,17 +769,12 @@ impl<'ctx> CodeGenerator<'ctx> {
             TypedStmt::Expr { expression, .. } => {
                 if let TypedExpr::Call {
                     function,
-                    name,
                     arguments,
                     ty,
                     ..
                 } = expression
                 {
-                    if name == "make_slice" {
-                        self.generate_expression(expression)?;
-                    } else {
-                        self.generate_call(*function, arguments, ty.clone(), expression.span())?;
-                    }
+                    self.generate_call(*function, arguments, ty.clone(), expression.span())?;
                 } else {
                     self.generate_expression(expression)?;
                 }
@@ -744,6 +844,30 @@ impl<'ctx> CodeGenerator<'ctx> {
         for action in actions {
             self.builder
                 .build_call(action.function, &action.arguments, "defer.call")?;
+        }
+        Ok(())
+    }
+
+    fn emit_mir_cleanup(&mut self) -> Result<(), CodegenError> {
+        let actions = self.mir_cleanup.clone();
+        for action in actions {
+            let arguments = action
+                .arguments
+                .iter()
+                .map(|argument| {
+                    let value = self.generate_expression(argument)?;
+                    let value =
+                        self.abi_pack(value, action.function, argument.ty(), argument.span())?;
+                    Ok(BasicMetadataValueEnum::from(value))
+                })
+                .collect::<Result<Vec<_>, CodegenError>>()?;
+            let function = self
+                .functions
+                .get(&action.function)
+                .copied()
+                .ok_or_else(|| CodegenError::at("unknown deferred function", action.span))?;
+            self.builder
+                .build_call(function, &arguments, "defer.call")?;
         }
         Ok(())
     }
@@ -934,7 +1058,7 @@ impl<'ctx> CodeGenerator<'ctx> {
                 let ok = self.context.append_basic_block(f, "propagate.ok");
                 self.builder.build_conditional_branch(tag, eb, ok)?;
                 self.builder.position_at_end(eb);
-                self.emit_defers_from(0)?;
+                self.emit_mir_cleanup()?;
                 let rv = self
                     .builder
                     .build_extract_value(v, 2, "propagate.error.value")?;
@@ -1059,49 +1183,51 @@ impl<'ctx> CodeGenerator<'ctx> {
                 span,
                 ..
             } => self.generate_binary(left, *operator, right, operand_type.clone(), *span),
+            TypedExpr::MakeSlice {
+                pointer,
+                length,
+                span,
+                ..
+            } => {
+                let pointer = self.generate_expression(pointer)?.into_pointer_value();
+                let length = self.generate_expression(length)?.into_int_value();
+                let not_null = self.builder.build_is_not_null(pointer, "slice.not_null")?;
+                let empty = self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    length,
+                    length.get_type().const_zero(),
+                    "slice.empty",
+                )?;
+                self.guard(
+                    self.builder.build_or(not_null, empty, "slice.valid")?,
+                    *span,
+                )?;
+                let st = self.slice_type();
+                let mut value = st.get_undef();
+                value = self
+                    .builder
+                    .build_insert_value(value, pointer, 0, "slice.ptr")?
+                    .into_struct_value();
+                value = self
+                    .builder
+                    .build_insert_value(value, length, 1, "slice.len")?
+                    .into_struct_value();
+                Ok(value.into())
+            }
             TypedExpr::Call {
                 function,
                 name,
                 arguments,
                 ty,
                 ..
-            } => {
-                if name == "make_slice" {
-                    let pointer = self
-                        .generate_expression(&arguments[0])?
-                        .into_pointer_value();
-                    let length = self.generate_expression(&arguments[1])?.into_int_value();
-                    let not_null = self.builder.build_is_not_null(pointer, "slice.not_null")?;
-                    let empty = self.builder.build_int_compare(
-                        IntPredicate::EQ,
-                        length,
-                        length.get_type().const_zero(),
-                        "slice.empty",
-                    )?;
-                    self.guard(
-                        self.builder.build_or(not_null, empty, "slice.valid")?,
+            } => self
+                .generate_call(*function, arguments, ty.clone(), e.span())?
+                .ok_or_else(|| {
+                    CodegenError::at(
+                        format!("void function `{name}` has no value of type {ty:?}"),
                         e.span(),
-                    )?;
-                    let st = self.slice_type();
-                    let mut value = st.get_undef();
-                    value = self
-                        .builder
-                        .build_insert_value(value, pointer, 0, "slice.ptr")?
-                        .into_struct_value();
-                    value = self
-                        .builder
-                        .build_insert_value(value, length, 1, "slice.len")?
-                        .into_struct_value();
-                    return Ok(value.into());
-                }
-                self.generate_call(*function, arguments, ty.clone(), e.span())?
-                    .ok_or_else(|| {
-                        CodegenError::at(
-                            format!("void function `{name}` has no value of type {ty:?}"),
-                            e.span(),
-                        )
-                    })
-            }
+                    )
+                }),
         }
     }
     fn generate_binary(

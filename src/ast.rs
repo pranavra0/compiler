@@ -294,7 +294,7 @@ pub enum BinaryOp {
     ShiftRight,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Unit,
     Named(String),
