@@ -2,12 +2,13 @@ use crate::ast::Program;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::lexer::Span;
 use crate::mir::{FlowFlags as Flow, MirFunction, MirInstruction, MirProgram, MirTerminator};
-use crate::semantic;
+use crate::pipeline;
 use crate::typed::{
     DefId, FunctionId, IntegerWidth, LayoutKind, LocalId, ResolvedType, TypedBlock, TypedExpr,
     TypedPlace, TypedProgram, TypedStmt,
 };
 use inkwell::AddressSpace;
+use inkwell::AtomicOrdering;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::BuilderError;
 use inkwell::context::Context;
@@ -19,7 +20,8 @@ use inkwell::module::{Linkage, Module};
 use inkwell::targets::TargetData;
 use inkwell::types::{BasicType, BasicTypeEnum, StringRadix, StructType};
 use inkwell::values::{
-    ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
+    PointerValue,
 };
 use inkwell::{FloatPredicate, IntPredicate};
 use std::collections::{HashMap, HashSet};
@@ -182,8 +184,8 @@ impl<'ctx> CodeGenerator<'ctx> {
         }
     }
     pub fn generate(self, p: &Program) -> Result<Module<'ctx>, CodegenError> {
-        let t = semantic::analyze_typed_with_pointer_width(p, self.pointer_width)
-            .map_err(|e| CodegenError::new(format!("semantic error: {e}")))?;
+        let t = pipeline::analyze_program_with_pointer_width(p, self.pointer_width)
+            .map_err(|e| CodegenError::new(format!("frontend error: {e}")))?;
         self.generate_typed(&t)
     }
     pub fn generate_typed(mut self, p: &TypedProgram) -> Result<Module<'ctx>, CodegenError> {
@@ -1183,6 +1185,98 @@ impl<'ctx> CodeGenerator<'ctx> {
                 span,
                 ..
             } => self.generate_binary(left, *operator, right, operand_type.clone(), *span),
+            TypedExpr::LowLevel {
+                operation,
+                arguments,
+                ty,
+                span,
+            } => {
+                let unit = || self.context.i8_type().const_zero().into();
+                match operation {
+                    crate::typed::LowLevelOperation::VolatileLoad => {
+                        let pointer = arguments.first().ok_or_else(|| {
+                            CodegenError::at("volatile_load requires a pointer", *span)
+                        })?;
+                        let pointer = self.generate_expression(pointer)?.into_pointer_value();
+                        let value = self.builder.build_load(
+                            self.basic_type(ty.clone())?,
+                            pointer,
+                            "volatile.load",
+                        )?;
+                        value
+                            .as_instruction_value()
+                            .ok_or_else(|| {
+                                CodegenError::at(
+                                    "volatile load did not produce an instruction",
+                                    *span,
+                                )
+                            })?
+                            .set_volatile(true)
+                            .map_err(|error| CodegenError::at(error.to_string(), *span))?;
+                        Ok(value)
+                    }
+                    crate::typed::LowLevelOperation::VolatileStore => {
+                        let pointer = arguments.first().ok_or_else(|| {
+                            CodegenError::at("volatile_store requires a pointer", *span)
+                        })?;
+                        let value = arguments.get(1).ok_or_else(|| {
+                            CodegenError::at("volatile_store requires a value", *span)
+                        })?;
+                        let pointer = self.generate_expression(pointer)?.into_pointer_value();
+                        let value = self.generate_expression(value)?;
+                        self.builder
+                            .build_store(pointer, value)?
+                            .set_volatile(true)
+                            .map_err(|error| CodegenError::at(error.to_string(), *span))?;
+                        Ok(unit())
+                    }
+                    crate::typed::LowLevelOperation::AtomicLoad => {
+                        let pointer = arguments.first().ok_or_else(|| {
+                            CodegenError::at("atomic_load requires a pointer", *span)
+                        })?;
+                        let pointer = self.generate_expression(pointer)?.into_pointer_value();
+                        let value = self.builder.build_load(
+                            self.basic_type(ty.clone())?,
+                            pointer,
+                            "atomic.load",
+                        )?;
+                        value
+                            .as_instruction_value()
+                            .ok_or_else(|| {
+                                CodegenError::at(
+                                    "atomic load did not produce an instruction",
+                                    *span,
+                                )
+                            })?
+                            .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+                            .map_err(|error| CodegenError::at(error.to_string(), *span))?;
+                        Ok(value)
+                    }
+                    crate::typed::LowLevelOperation::AtomicStore => {
+                        let pointer = arguments.first().ok_or_else(|| {
+                            CodegenError::at("atomic_store requires a pointer", *span)
+                        })?;
+                        let value = arguments.get(1).ok_or_else(|| {
+                            CodegenError::at("atomic_store requires a value", *span)
+                        })?;
+                        let pointer = self.generate_expression(pointer)?.into_pointer_value();
+                        let value = self.generate_expression(value)?;
+                        self.builder
+                            .build_store(pointer, value)?
+                            .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+                            .map_err(|error| CodegenError::at(error.to_string(), *span))?;
+                        Ok(unit())
+                    }
+                    crate::typed::LowLevelOperation::Fence => {
+                        self.builder.build_fence(
+                            AtomicOrdering::SequentiallyConsistent,
+                            false,
+                            "fence",
+                        )?;
+                        Ok(unit())
+                    }
+                }
+            }
             TypedExpr::MakeSlice {
                 pointer,
                 length,

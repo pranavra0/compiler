@@ -163,6 +163,17 @@ impl InstantiationTable {
         self.queue.pop_front()
     }
 
+    /// Number of structural instantiations which still need expansion.
+    pub fn pending_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Consume the work queue without exposing linker spellings. A frontend
+    /// can use this to drive recursive and mutually-dependent expansion.
+    pub fn drain_pending(&mut self) -> impl Iterator<Item = InstantiationId> + '_ {
+        std::iter::from_fn(|| self.pop_pending())
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -184,6 +195,11 @@ pub enum Intrinsic {
     ReturnErr,
     IsErr,
     Unwrap,
+    VolatileLoad,
+    VolatileStore,
+    AtomicLoad,
+    AtomicStore,
+    Fence,
 }
 
 impl Intrinsic {
@@ -194,12 +210,31 @@ impl Intrinsic {
             "return_err" => Self::ReturnErr,
             "is_err" => Self::IsErr,
             "unwrap" => Self::Unwrap,
+            "volatile_load" => Self::VolatileLoad,
+            "volatile_store" => Self::VolatileStore,
+            "atomic_load" => Self::AtomicLoad,
+            "atomic_store" => Self::AtomicStore,
+            "fence" => Self::Fence,
             _ => return None,
         })
     }
 
     pub fn is_result(self) -> bool {
-        !matches!(self, Self::MakeSlice)
+        matches!(
+            self,
+            Self::ReturnOk | Self::ReturnErr | Self::IsErr | Self::Unwrap
+        )
+    }
+
+    pub fn is_low_level(self) -> bool {
+        matches!(
+            self,
+            Self::VolatileLoad
+                | Self::VolatileStore
+                | Self::AtomicLoad
+                | Self::AtomicStore
+                | Self::Fence
+        )
     }
 }
 
@@ -398,6 +433,15 @@ pub enum TypedStmt {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LowLevelOperation {
+    VolatileLoad,
+    VolatileStore,
+    AtomicLoad,
+    AtomicStore,
+    Fence,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExpr {
     Integer {
@@ -478,6 +522,14 @@ pub enum TypedExpr {
         ty: ResolvedType,
         span: Span,
     },
+    /// Explicit machine operation. Backends may reject an operation when the
+    /// selected target cannot provide it, but must not silently emulate it.
+    LowLevel {
+        operation: LowLevelOperation,
+        arguments: Vec<TypedExpr>,
+        ty: ResolvedType,
+        span: Span,
+    },
     Null {
         ty: ResolvedType,
         span: Span,
@@ -541,6 +593,7 @@ impl TypedExpr {
             | Self::Binary { ty, .. }
             | Self::Call { ty, .. }
             | Self::MakeSlice { ty, .. }
+            | Self::LowLevel { ty, .. }
             | Self::Null { ty, .. }
             | Self::AddressOf { ty, .. }
             | Self::Dereference { ty, .. }
@@ -567,6 +620,7 @@ impl TypedExpr {
             | Self::Binary { span, .. }
             | Self::Call { span, .. }
             | Self::MakeSlice { span, .. }
+            | Self::LowLevel { span, .. }
             | Self::Null { span, .. }
             | Self::AddressOf { span, .. }
             | Self::Dereference { span, .. }

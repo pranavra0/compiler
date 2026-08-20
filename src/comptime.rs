@@ -9,7 +9,7 @@ use std::fmt;
 
 use crate::ast::{BinaryOp, Block, Decl, Expr, FunctionDecl, Program, Stmt, Type, UnaryOp};
 use crate::lexer::Span;
-use crate::typed::{DefId, InstantiationKey, InstantiationTable, TypeId};
+use crate::typed::{DefId, InstantiationKey, InstantiationTable, TypeId, TypedExpr};
 
 const DEFAULT_STEP_LIMIT: u64 = 100_000;
 const DEFAULT_RECURSION_LIMIT: usize = 128;
@@ -177,6 +177,13 @@ fn specialize_program(program: &Program) -> Result<Program, Error> {
             }),
         }
     }
+    // Drain structural work only after the source walk has registered all
+    // dependencies. The queue is the expansion boundary; linker spellings
+    // are still derived below solely for the compatibility AST.
+    let _completed_instantiations = specializer
+        .instantiations
+        .drain_pending()
+        .collect::<Vec<_>>();
     let mut generated = specializer.generated.into_values().collect::<Vec<_>>();
     generated.sort_by(|a, b| a.name.cmp(&b.name));
     let mut generated_declarations = generated
@@ -189,10 +196,13 @@ fn specialize_program(program: &Program) -> Result<Program, Error> {
         .collect::<Vec<_>>();
     generated_structs.sort_by(|a, b| a.name.cmp(&b.name));
     generated_declarations.extend(generated_structs.into_iter().map(Decl::Struct));
-    generated_declarations.extend(declarations);
+    // Preserve graph declaration IDs: source declarations stay in their
+    // canonical order and generated declarations are appended as a new
+    // work-queue result. They still re-enter ordinary name resolution.
+    declarations.extend(generated_declarations);
     Ok(Program {
         imports: program.imports.clone(),
-        declarations: generated_declarations,
+        declarations,
     })
 }
 
@@ -297,7 +307,7 @@ impl<'a> Specializer<'a> {
             type_arguments,
             value_arguments: Vec::new(),
         });
-        if !fresh && self.instantiations.len() > MAX_SPECIALIZATIONS {
+        if fresh && self.instantiations.len() > MAX_SPECIALIZATIONS {
             return Err(Error::InvalidOperation {
                 message: "generic specialization limit exceeded".into(),
                 span,
@@ -2109,6 +2119,45 @@ pub fn reflect_module(program: &Program) -> Vec<DeclarationInfo> {
 
 /// Reflect resolved source declarations. This is deliberately a data API: a
 /// caller never has to parse formatted compiler output.
+/// Evaluate an already-resolved pure expression through the same typed
+/// evaluator used by constant-folding clients. Syntax evaluation remains
+/// available below for declaration generation, where an AST value is needed.
+pub fn evaluate_typed(expression: &TypedExpr) -> Result<Value, Error> {
+    typed_value(crate::typed_eval::evaluate(expression), expression.span())
+}
+
+fn typed_value(
+    value: Result<crate::typed_eval::Value, crate::typed_eval::Error>,
+    span: Span,
+) -> Result<Value, Error> {
+    let value = value.map_err(|error| Error::InvalidOperation {
+        message: error.to_string(),
+        span,
+    })?;
+    Ok(match value {
+        crate::typed_eval::Value::Unit => Value::Unit,
+        crate::typed_eval::Value::Bool(value) => Value::Bool(value),
+        crate::typed_eval::Value::Integer(value) => Value::Integer(value),
+        crate::typed_eval::Value::Float(value) => Value::Float(value),
+        crate::typed_eval::Value::Struct(fields) => Value::Array(
+            fields
+                .into_iter()
+                .map(|field| typed_value(Ok(field), span))
+                .collect::<Result<_, _>>()?,
+        ),
+        crate::typed_eval::Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| typed_value(Ok(value), span))
+                .collect::<Result<_, _>>()?,
+        ),
+        crate::typed_eval::Value::Result { error, value } => Value::Struct {
+            name: if error { "result_err" } else { "result_ok" }.into(),
+            fields: vec![("value".into(), typed_value(Ok(*value), span)?)],
+        },
+    })
+}
+
 pub fn evaluate(program: &Program, expression: &Expr, pointer_width: u32) -> Result<Value, Error> {
     evaluate_with_limits(program, expression, pointer_width, Limits::default())
 }

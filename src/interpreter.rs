@@ -155,10 +155,32 @@ fn call_mir(
                 }
                 MirInstruction::Store { target, value, .. } => {
                     let evaluated = eval_expr(program, globals, &mut env, value)?;
+                    if contains_propagation(value)
+                        && matches!(evaluated, Value::Result { error: true, .. })
+                    {
+                        let actions = mir_function
+                            .cleanup
+                            .get(&block.id)
+                            .cloned()
+                            .unwrap_or_default();
+                        run_cleanup(program, globals, &mut env, &actions)?;
+                        return Ok(evaluated);
+                    }
                     store(program, globals, &mut env, target, evaluated)?;
                 }
                 MirInstruction::Expr { expression, .. } => {
-                    eval_expr(program, globals, &mut env, expression)?;
+                    let evaluated = eval_expr(program, globals, &mut env, expression)?;
+                    if contains_propagation(expression)
+                        && matches!(evaluated, Value::Result { error: true, .. })
+                    {
+                        let actions = mir_function
+                            .cleanup
+                            .get(&block.id)
+                            .cloned()
+                            .unwrap_or_default();
+                        run_cleanup(program, globals, &mut env, &actions)?;
+                        return Ok(evaluated);
+                    }
                 }
                 MirInstruction::RunDefers { actions, .. } => {
                     for action in actions {
@@ -364,7 +386,13 @@ fn eval_expr(
             operand,
             ty,
             ..
-        } => unary(*operator, eval_expr(program, globals, env, operand)?, ty),
+        } => {
+            let value = eval_expr(program, globals, env, operand)?;
+            if propagated(&value) && contains_propagation(operand) {
+                return Ok(value);
+            }
+            unary(*operator, value, ty)
+        }
         TypedExpr::Binary {
             left,
             operator,
@@ -373,33 +401,42 @@ fn eval_expr(
             ..
         } => {
             let left_value = eval_expr(program, globals, env, left)?;
+            if propagated(&left_value) && contains_propagation(left) {
+                return Ok(left_value);
+            }
             if *operator == BinaryOp::LogicalAnd && !truth(&left_value)? {
                 return Ok(Value::Bool(false));
             }
             if *operator == BinaryOp::LogicalOr && truth(&left_value)? {
                 return Ok(Value::Bool(true));
             }
-            binary(
-                *operator,
-                left_value,
-                eval_expr(program, globals, env, right)?,
-                operand_type,
-            )
+            let right_value = eval_expr(program, globals, env, right)?;
+            if propagated(&right_value) && contains_propagation(right) {
+                return Ok(right_value);
+            }
+            binary(*operator, left_value, right_value, operand_type)
         }
         TypedExpr::Call {
             function,
             arguments,
             ..
         } => {
-            let args = arguments
-                .iter()
-                .map(|x| eval_expr(program, globals, env, x))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut args = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                let value = eval_expr(program, globals, env, argument)?;
+                if propagated(&value) && contains_propagation(argument) {
+                    return Ok(value);
+                }
+                args.push(value);
+            }
             call(program, globals, *function, args)
         }
         TypedExpr::MakeSlice { .. } => Err(Error(
             "interpreter does not support raw-pointer slice construction".into(),
         )),
+        TypedExpr::LowLevel { operation, .. } => Err(Error(format!(
+            "interpreter does not support low-level operation {operation:?}"
+        ))),
         TypedExpr::Layout {
             kind,
             target,
@@ -418,14 +455,26 @@ fn eval_expr(
             };
             Ok(Value::Int(value as i128))
         }
-        TypedExpr::ResultOk { value, .. } => Ok(Value::Result {
-            error: false,
-            value: Box::new(eval_expr(program, globals, env, value)?),
-        }),
-        TypedExpr::ResultErr { value, .. } => Ok(Value::Result {
-            error: true,
-            value: Box::new(eval_expr(program, globals, env, value)?),
-        }),
+        TypedExpr::ResultOk { value, .. } => {
+            let evaluated = eval_expr(program, globals, env, value)?;
+            if propagated(&evaluated) && contains_propagation(value) {
+                return Ok(evaluated);
+            }
+            Ok(Value::Result {
+                error: false,
+                value: Box::new(evaluated),
+            })
+        }
+        TypedExpr::ResultErr { value, .. } => {
+            let evaluated = eval_expr(program, globals, env, value)?;
+            if propagated(&evaluated) && contains_propagation(value) {
+                return Ok(evaluated);
+            }
+            Ok(Value::Result {
+                error: true,
+                value: Box::new(evaluated),
+            })
+        }
         TypedExpr::IsErr { value, .. } => match eval_expr(program, globals, env, value)? {
             Value::Result { error, .. } => Ok(Value::Bool(error)),
             _ => Err(Error("is_err requires a result".into())),
@@ -635,6 +684,60 @@ fn integer_binary(op: BinaryOp, a: i128, b: i128, ty: &ResolvedType) -> Result<V
         _ => return Err(Error("unsupported integer operation".into())),
     };
     Ok(out)
+}
+
+/// Whether an expression contains the explicit result-propagation operator.
+/// MIR treats an error result from such an expression as a function exit;
+/// keeping this fact here prevents the interpreter from inventing a second
+/// propagation convention for declarations, stores, and expression statements.
+fn propagated(value: &Value) -> bool {
+    matches!(value, Value::Result { error: true, .. })
+}
+
+fn contains_propagation(expression: &TypedExpr) -> bool {
+    match expression {
+        TypedExpr::Propagate { .. } => true,
+        TypedExpr::Unary { operand, .. } => contains_propagation(operand),
+        TypedExpr::Binary { left, right, .. } => {
+            contains_propagation(left) || contains_propagation(right)
+        }
+        TypedExpr::StructLiteral { fields, .. } => fields.iter().any(contains_propagation),
+        TypedExpr::ArrayLiteral { elements, .. } => elements.iter().any(contains_propagation),
+        TypedExpr::Field { place, .. } | TypedExpr::Index { place, .. } => {
+            place_contains_propagation(place)
+        }
+        TypedExpr::Call { arguments, .. } => arguments.iter().any(contains_propagation),
+        TypedExpr::MakeSlice {
+            pointer, length, ..
+        } => contains_propagation(pointer) || contains_propagation(length),
+        TypedExpr::ResultOk { value, .. }
+        | TypedExpr::ResultErr { value, .. }
+        | TypedExpr::IsErr { value, .. }
+        | TypedExpr::Unwrap { value, .. } => contains_propagation(value),
+        TypedExpr::AddressOf { place, .. } | TypedExpr::Dereference { place, .. } => {
+            place_contains_propagation(place)
+        }
+        TypedExpr::Integer { .. }
+        | TypedExpr::Float { .. }
+        | TypedExpr::Bool { .. }
+        | TypedExpr::Load { .. }
+        | TypedExpr::GlobalLoad { .. }
+        | TypedExpr::Null { .. }
+        | TypedExpr::Layout { .. }
+        | TypedExpr::LowLevel { .. } => false,
+    }
+}
+
+fn place_contains_propagation(place: &TypedPlace) -> bool {
+    match place {
+        TypedPlace::Temporary { value, .. } => contains_propagation(value),
+        TypedPlace::Field { base, .. } => place_contains_propagation(base),
+        TypedPlace::Index { base, index, .. } => {
+            place_contains_propagation(base) || contains_propagation(index)
+        }
+        TypedPlace::Dereference { pointer, .. } => contains_propagation(pointer),
+        TypedPlace::Local { .. } | TypedPlace::Global { .. } => false,
+    }
 }
 
 fn truth(v: &Value) -> Result<bool, Error> {

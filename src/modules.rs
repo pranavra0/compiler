@@ -50,6 +50,53 @@ pub struct ModuleGraph {
 }
 
 impl ModuleGraph {
+    /// Verify that the typed frontend consumed the graph's declaration
+    /// identities instead of rebuilding a name-based symbol order.
+    pub fn validate_typed(&self, typed: &TypedProgram) -> Result<(), String> {
+        if typed.symbols.definitions.len() < self.definitions.len() {
+            return Err(format!(
+                "resolved graph contains {} declarations but typed frontend produced {}",
+                self.definitions.len(),
+                typed.symbols.definitions.len()
+            ));
+        }
+        for definition in &self.definitions {
+            // Generic declarations are replaced by concrete declarations
+            // before typed lowering, and imported declarations acquire a
+            // backend spelling at the AST boundary. Match those two explicit
+            // boundary cases by graph metadata; all later semantic references
+            // still use the typed DefId.
+            let symbol = typed
+                .symbols
+                .find(&definition.linker_name)
+                .or_else(|| typed.symbols.find(&definition.source_name))
+                .or_else(|| {
+                    typed.symbols.definitions.iter().find(|symbol| {
+                        symbol
+                            .name
+                            .starts_with(&format!("{}__", definition.source_name))
+                            || symbol
+                                .name
+                                .ends_with(&format!("_{}", definition.source_name))
+                    })
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "typed frontend lost declaration {} (`{}` / `{}`)",
+                        definition.id, definition.source_name, definition.linker_name
+                    )
+                })?;
+            let expected = definition.kind.clone();
+            if symbol.kind != expected {
+                return Err(format!(
+                    "typed declaration {} has the wrong kind",
+                    definition.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn module(&self, id: ModuleId) -> Option<&ModuleInfo> {
         self.modules
             .get(id.index())
@@ -120,7 +167,7 @@ impl Project {
     /// The compatibility AST is an implementation boundary; callers no
     /// longer need to know how module source is assembled.
     pub fn analyze(&self, pointer_width: u32) -> Result<TypedProgram, pipeline::FrontendError> {
-        pipeline::analyze_program_with_pointer_width(&self.program, pointer_width)
+        pipeline::analyze_resolved_program(&self.program, &self.graph, pointer_width)
     }
 
     pub fn analyze_native(&self) -> Result<TypedProgram, pipeline::FrontendError> {

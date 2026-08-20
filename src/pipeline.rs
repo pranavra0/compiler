@@ -4,6 +4,7 @@ use crate::ast::Program;
 use crate::comptime;
 use crate::lexer::{LexError, Lexer, Span, Token, TokenKind};
 use crate::mir::{MirError, MirProgram};
+use crate::modules::ModuleGraph;
 use crate::parser::{ParseError, Parser};
 use crate::semantic::{self, SemanticError};
 use crate::typed::TypedProgram;
@@ -15,6 +16,7 @@ pub enum FrontendError {
     Semantic(SemanticError),
     Comptime(comptime::Error),
     Mir(MirError),
+    Resolution { message: String, span: Span },
 }
 
 impl FrontendError {
@@ -25,6 +27,7 @@ impl FrontendError {
             Self::Semantic(_) => "semantic",
             Self::Comptime(_) => "comptime",
             Self::Mir(_) => "mir",
+            Self::Resolution { .. } => "resolution",
         }
     }
 
@@ -46,6 +49,7 @@ impl FrontendError {
             Self::Semantic(error) => error.span(),
             Self::Comptime(error) => error.span(),
             Self::Mir(error) => error.span(),
+            Self::Resolution { span, .. } => *span,
         }
     }
 }
@@ -69,6 +73,7 @@ impl FrontendError {
             Self::Semantic(error) => error.to_string(),
             Self::Comptime(error) => error.to_string(),
             Self::Mir(error) => error.to_string(),
+            Self::Resolution { message, .. } => message.clone(),
         }
     }
 }
@@ -114,6 +119,27 @@ pub fn analyze_program_with_pointer_width(
 pub fn analyze_source(source: &str) -> Result<TypedProgram, FrontendError> {
     let program = parse_source(source)?;
     analyze_program(&program)
+}
+
+/// Analyze the graph-resolved project while keeping graph identities as the
+/// authority. The AST is only the syntax compatibility view; this check makes
+/// it impossible for a frontend/backend pass to silently invent a different
+/// declaration ordering or kind.
+pub fn analyze_resolved_program(
+    program: &Program,
+    graph: &ModuleGraph,
+    pointer_width: u32,
+) -> Result<TypedProgram, FrontendError> {
+    let expanded = comptime::expand(program, pointer_width).map_err(FrontendError::Comptime)?;
+    let typed = semantic::analyze_typed_with_graph(&expanded, graph, pointer_width)
+        .map_err(FrontendError::Semantic)?;
+    graph
+        .validate_typed(&typed)
+        .map_err(|message| FrontendError::Resolution {
+            message,
+            span: Span::new(0, 0),
+        })?;
+    Ok(typed)
 }
 
 /// Lower a validated typed program to the shared control-flow representation.

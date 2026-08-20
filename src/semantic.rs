@@ -7,10 +7,11 @@ use crate::ast::{
 };
 use crate::lexer::Span;
 use crate::mir::FlowFlags as Flow;
+use crate::modules::ModuleGraph;
 use crate::typed::{
-    DefId, FunctionId, IntegerWidth, Intrinsic, LayoutKind, LocalId, ResolvedType, TypeInterner,
-    TypedBlock, TypedConstant, TypedExpr, TypedField, TypedFunction, TypedGlobal, TypedParameter,
-    TypedPlace, TypedProgram, TypedStmt, TypedStruct,
+    DefId, FunctionId, IntegerWidth, Intrinsic, LayoutKind, LocalId, LowLevelOperation,
+    ResolvedType, TypeInterner, TypedBlock, TypedConstant, TypedExpr, TypedField, TypedFunction,
+    TypedGlobal, TypedParameter, TypedPlace, TypedProgram, TypedStmt, TypedStruct,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +196,17 @@ pub fn analyze_typed_with_pointer_width(
     pointer_width: u32,
 ) -> Result<TypedProgram, SemanticError> {
     Analyzer::with_pointer_width(pointer_width).analyze_typed(program)
+}
+
+/// Lower a graph-resolved compatibility view while taking declaration IDs
+/// from the canonical module graph. Name spellings remain only syntax and
+/// diagnostic metadata; typed references use these graph-owned IDs.
+pub fn analyze_typed_with_graph(
+    program: &Program,
+    graph: &ModuleGraph,
+    pointer_width: u32,
+) -> Result<TypedProgram, SemanticError> {
+    TypedLowerer::new_with_graph(program, graph, pointer_width).lower()
 }
 
 pub fn validate_entry_point(program: &Program) -> Result<(), SemanticError> {
@@ -1410,21 +1422,44 @@ struct TypedLowerer<'a> {
 }
 impl<'a> TypedLowerer<'a> {
     fn new_with_pointer_width(p: &'a Program, _pointer_width: u32) -> Self {
+        Self::new_with_ids(p, None)
+    }
+
+    fn new_with_graph(p: &'a Program, graph: &ModuleGraph, _pointer_width: u32) -> Self {
+        let mut ids = HashMap::new();
+        for definition in &graph.definitions {
+            ids.insert(definition.source_name.clone(), definition.id);
+            ids.insert(definition.linker_name.clone(), definition.id);
+        }
+        Self::new_with_ids(p, Some(ids))
+    }
+
+    fn new_with_ids(p: &'a Program, graph_ids: Option<HashMap<String, DefId>>) -> Self {
         let mut functions = HashMap::new();
         let mut structs = HashMap::new();
         let mut globals = HashMap::new();
         let mut constants = HashMap::new();
         let mut global_ids = HashMap::new();
         let mut definition_ids = HashMap::new();
-        let mut next_def = 0u32;
+        let mut next_def = graph_ids
+            .as_ref()
+            .and_then(|ids| ids.values().map(|id| id.0).max())
+            .map_or(0, |id| id.saturating_add(1));
         for d in &p.declarations {
-            let (name, id) = match d {
-                Decl::Function(f) => (&f.name, DefId(next_def)),
-                Decl::Struct(s) => (&s.name, DefId(next_def)),
-                Decl::Variable(v) => (&v.name, DefId(next_def)),
+            let name = match d {
+                Decl::Function(f) => &f.name,
+                Decl::Struct(s) => &s.name,
+                Decl::Variable(v) => &v.name,
                 Decl::Comptime { .. } => continue,
             };
-            next_def += 1;
+            let id = graph_ids
+                .as_ref()
+                .and_then(|ids| ids.get(name).copied())
+                .unwrap_or_else(|| {
+                    let id = DefId(next_def);
+                    next_def = next_def.saturating_add(1);
+                    id
+                });
             definition_ids.insert(name.clone(), id);
             match d {
                 Decl::Function(f) => {
@@ -1593,6 +1628,15 @@ impl<'a> TypedLowerer<'a> {
     ) -> Result<TypedExpr, SemanticError> {
         let lowered = self.lower_expr(e, expected)?;
         let value = self.fold_constant(lowered)?;
+        // Pure typed constants use the shared evaluator. Layout queries are
+        // kept as typed operations because their target data belongs to the
+        // backend-aware frontend, not to this target-neutral helper.
+        if !contains_layout_query(&value) && !crate::typed_eval::is_constant(&value) {
+            return Err(SemanticError::InvalidOperand {
+                message: "global initializer is not supported by the typed evaluator".into(),
+                span: e.span(),
+            });
+        }
         if !is_folded_constant(&value) {
             return Err(SemanticError::InvalidOperand {
                 message: "global initializer must be a compile-time evaluable constant".into(),
@@ -2642,6 +2686,62 @@ impl<'a> TypedLowerer<'a> {
                         span,
                     });
                 }
+                if let Some(intrinsic) = Intrinsic::from_name(name).filter(|x| x.is_low_level()) {
+                    let operation = match intrinsic {
+                        Intrinsic::VolatileLoad => LowLevelOperation::VolatileLoad,
+                        Intrinsic::VolatileStore => LowLevelOperation::VolatileStore,
+                        Intrinsic::AtomicLoad => LowLevelOperation::AtomicLoad,
+                        Intrinsic::AtomicStore => LowLevelOperation::AtomicStore,
+                        Intrinsic::Fence => LowLevelOperation::Fence,
+                        _ => unreachable!("low-level intrinsic registry is exhaustive"),
+                    };
+                    let expected_arguments = if matches!(intrinsic, Intrinsic::Fence) {
+                        0
+                    } else if matches!(intrinsic, Intrinsic::VolatileStore | Intrinsic::AtomicStore)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    if arguments.len() != expected_arguments {
+                        return Err(SemanticError::WrongArgumentCount {
+                            name: name.clone(),
+                            expected: expected_arguments,
+                            found: arguments.len(),
+                            span,
+                        });
+                    }
+                    if matches!(intrinsic, Intrinsic::Fence) {
+                        return Ok(TypedExpr::LowLevel {
+                            operation,
+                            arguments: Vec::new(),
+                            ty: ResolvedType::Unit,
+                            span,
+                        });
+                    }
+                    let pointer = self.lower_expr(&arguments[0], None)?;
+                    let ResolvedType::Pointer(element) = pointer.ty() else {
+                        return Err(SemanticError::InvalidOperand {
+                            message: format!("{name} requires a pointer argument"),
+                            span,
+                        });
+                    };
+                    let mut lowered = vec![pointer];
+                    if expected_arguments == 2 {
+                        lowered.push(self.lower_expr(&arguments[1], Some(*element.clone()))?);
+                    }
+                    let ty = if expected_arguments == 1 {
+                        *element
+                    } else {
+                        ResolvedType::Unit
+                    };
+                    return Ok(TypedExpr::LowLevel {
+                        operation,
+                        arguments: lowered,
+                        ty,
+                        span,
+                    });
+                }
                 let Some((id, f)) = self.functions.get(name).copied() else {
                     return Err(SemanticError::UndefinedName {
                         name: name.clone(),
@@ -2894,6 +2994,19 @@ fn place_name(e: &Expr) -> String {
 fn named(n: &str) -> Type {
     Type::Named(n.into())
 }
+fn contains_layout_query(e: &TypedExpr) -> bool {
+    match e {
+        TypedExpr::Layout { .. } => true,
+        TypedExpr::Unary { operand, .. } => contains_layout_query(operand),
+        TypedExpr::Binary { left, right, .. } => {
+            contains_layout_query(left) || contains_layout_query(right)
+        }
+        TypedExpr::StructLiteral { fields, .. } => fields.iter().any(contains_layout_query),
+        TypedExpr::ArrayLiteral { elements, .. } => elements.iter().any(contains_layout_query),
+        _ => false,
+    }
+}
+
 fn is_folded_constant(e: &TypedExpr) -> bool {
     match e {
         TypedExpr::Integer { .. }
